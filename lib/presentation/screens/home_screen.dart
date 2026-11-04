@@ -344,3 +344,192 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       ),
     );
   }
+  Widget _statusBar() => Container(
+    width: double.infinity,
+    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 9),
+    color: const Color(0xFF171C26),
+    child: Row(children: [
+      if (_loading)
+        const SizedBox(width: 16, height: 16,
+          child: CircularProgressIndicator(strokeWidth: 2)),
+      if (_loading) const SizedBox(width: 10),
+      Expanded(child: Text(_status,
+        maxLines: 1, overflow: TextOverflow.ellipsis,
+        style: const TextStyle(color: Color(0xFFD6AD55), fontSize: 12))),
+      Text('${_channels.length} canais',
+        style: const TextStyle(color: Colors.white54, fontSize: 12)),
+    ]),
+  );
+
+  Widget _sourcesPanel() => SingleChildScrollView(
+    padding: const EdgeInsets.all(16),
+    child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      const Text('ADICIONAR LISTA',
+        style: TextStyle(fontWeight: FontWeight.bold, letterSpacing: 1.3)),
+      const SizedBox(height: 12),
+      TextField(
+        controller: _url,
+        focusNode: _urlFocus,
+        decoration: const InputDecoration(
+          labelText: 'URL da lista M3U',
+          prefixIcon: Icon(Icons.link),
+        ),
+        keyboardType: TextInputType.url,
+      ),
+      const SizedBox(height: 8),
+      _actionButton('Carregar URL M3U', Icons.download, _loadUrl,
+        focusNode: _importFocus),
+      OutlinedButton.icon(
+        onPressed: _loadFile,
+        icon: const Icon(Icons.folder_open),
+        label: const Text('Abrir arquivo M3U'),
+      ),
+      const Divider(height: 32),
+      const Text('XTREAM CODES',
+        style: TextStyle(fontWeight: FontWeight.bold, letterSpacing: 1.3)),
+      const SizedBox(height: 12),
+      TextField(controller: _host,
+        decoration: const InputDecoration(labelText: 'URL do servidor')),
+      const SizedBox(height: 8),
+      TextField(controller: _username,
+        decoration: const InputDecoration(labelText: 'Usuário')),
+      const SizedBox(height: 8),
+      TextField(controller: _password, obscureText: true,
+        decoration: const InputDecoration(labelText: 'Senha')),
+      const SizedBox(height: 12),
+      _actionButton('Entrar e carregar canais', Icons.login, _loginXtream,
+        focusNode: _loginFocus),
+      const SizedBox(height: 12),
+      const Text(
+        'Use somente credenciais e listas autorizadas. '
+        'A sessão não é enviada a nenhum serviço deste aplicativo.',
+        style: TextStyle(color: Colors.white38, fontSize: 11),
+      ),
+    ]),
+  );
+
+  Widget _contentPanel() => Column(children: [
+    Expanded(flex: 6, child: _videoPanel()),
+    Expanded(flex: 5, child: _channelPanel()),
+  ]);
+
+  Widget _videoPanel() => Container(
+    margin: const EdgeInsets.all(12),
+    decoration: BoxDecoration(
+      color: Colors.black,
+      borderRadius: BorderRadius.circular(18),
+      border: Border.all(color: const Color(0xFF34302A)),
+    ),
+    clipBehavior: Clip.antiAlias,
+    child: Stack(children: [
+      Positioned.fill(child: _selected == null
+        ? const Center(child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.live_tv, size: 54, color: Color(0xFFD6AD55)),
+              SizedBox(height: 12),
+              Text('SELECIONE UM CANAL',
+                style: TextStyle(letterSpacing: 2, color: Colors.white70)),
+            ],
+          ))
+        : Video(
+            controller: _videoController,
+            fit: BoxFit.contain,
+            controls: NoVideoControls,
+          )),
+      Positioned(
+        right: 8, bottom: 8,
+        child: PopupMenuButton<String>(
+          tooltip: 'Proporção da tela',
+          onSelected: (value) {
+            setState(() => _aspect = value);
+            _player.setAspect(value);
+          },
+          itemBuilder: (_) => const [
+            PopupMenuItem(value: 'Original', child: Text('Original')),
+            PopupMenuItem(value: '16:9', child: Text('16:9')),
+            PopupMenuItem(value: '4:3', child: Text('4:3')),
+          ],
+          child: Chip(label: Text(_aspect)),
+        ),
+      ),
+    ]),
+  );
+
+  Widget _channelPanel() => Column(children: [
+    Padding(
+      padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
+      child: TextField(
+        controller: _search,
+        onChanged: _filter,
+        decoration: const InputDecoration(
+          prefixIcon: Icon(Icons.search),
+          hintText: 'Buscar canal ou categoria',
+          isDense: true,
+        ),
+      ),
+    ),
+    Expanded(
+      child: _visible.isEmpty
+        ? const Center(child: Text('Nenhum canal carregado.'))
+        : ListView.builder(
+            itemCount: _visible.length,
+            itemBuilder: (context, index) {
+              final channel = _visible[index];
+              final selected = channel == _selected;
+              return Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
+                child: Focus(
+                  child: Builder(builder: (context) {
+                    final focused = Focus.of(context).hasFocus;
+                    return Material(
+                      color: selected
+                        ? const Color(0xFF39301E)
+                        : focused
+                          ? const Color(0xFF282D38)
+                          : Colors.transparent,
+                      borderRadius: BorderRadius.circular(10),
+                      child: ListTile(
+                        autofocus: false,
+                        dense: true,
+                        leading: channel.logo != null && channel.logo!.startsWith('http')
+                          ? CircleAvatar(
+                              backgroundColor: Colors.white10,
+                              backgroundImage: NetworkImage(channel.logo!),
+                            )
+                          : const CircleAvatar(
+                              backgroundColor: Color(0xFF292F3B),
+                              child: Icon(Icons.tv, color: Color(0xFFD6AD55)),
+                            ),
+                        title: Text(channel.name,
+                          maxLines: 1, overflow: TextOverflow.ellipsis),
+                        subtitle: channel.group == null
+                          ? null : Text(channel.group!,
+                              maxLines: 1, overflow: TextOverflow.ellipsis),
+                        trailing: selected
+                          ? const Icon(Icons.graphic_eq, color: Color(0xFFD6AD55))
+                          : null,
+                        onTap: () => _play(channel),
+                      ),
+                    );
+                  }),
+                ),
+              );
+            },
+          ),
+    ),
+  ]);
+
+  Widget _compactSources() => ExpansionTile(
+    title: const Text('Listas e acesso Xtream'),
+    children: [SizedBox(height: 420, child: _sourcesPanel())],
+  );
+
+  Widget _actionButton(String label, IconData icon, VoidCallback action,
+      {FocusNode? focusNode}) => FilledButton.icon(
+    focusNode: focusNode,
+    onPressed: _loading ? null : action,
+    icon: Icon(icon),
+    label: Text(label),
+  );
+}

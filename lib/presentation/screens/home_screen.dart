@@ -21,6 +21,7 @@ class _HomeScreenState extends State<HomeScreen>
   late final VideoController _controller = VideoController(_player);
   late final TabController _tabs = TabController(length: 3, vsync: this);
   final TextEditingController _search = TextEditingController();
+  final ValueNotifier<String> _title = ValueNotifier<String>('');
 
   Profile? _profile;
   Catalog? _catalog;
@@ -28,6 +29,8 @@ class _HomeScreenState extends State<HomeScreen>
   String? _error;
   bool _full = false;
   Item? _current;
+  List<Item> _queue = <Item>[];
+  int _qi = -1;
 
   final Map<Kind, String?> _cat = {
     Kind.live: null,
@@ -51,6 +54,7 @@ class _HomeScreenState extends State<HomeScreen>
     _player.dispose();
     _tabs.dispose();
     _search.dispose();
+    _title.dispose();
     super.dispose();
   }
 
@@ -126,13 +130,18 @@ class _HomeScreenState extends State<HomeScreen>
     if (p != null) {
       await _player.stop();
       if (!mounted) return;
-      setState(() => _current = null);
+      setState(() {
+        _current = null;
+        _queue = <Item>[];
+        _qi = -1;
+      });
       await _loadProfile(p);
     }
   }
 
   Future<void> _play(Item it) async {
     setState(() => _current = it);
+    _title.value = it.name;
     await _player.open(Media(it.url, httpHeaders: _headers));
   }
 
@@ -141,8 +150,24 @@ class _HomeScreenState extends State<HomeScreen>
       _openSeries(it);
       return;
     }
+    _queue = <Item>[];
+    _qi = -1;
     await _play(it);
     if (full) await _enterFull();
+  }
+
+  Future<void> _nextEp() async {
+    if (_qi >= 0 && _qi < _queue.length - 1) {
+      _qi++;
+      await _play(_queue[_qi]);
+    }
+  }
+
+  Future<void> _prevEp() async {
+    if (_qi > 0) {
+      _qi--;
+      await _play(_queue[_qi]);
+    }
   }
 
   Future<void> _enterFull() async {
@@ -154,9 +179,18 @@ class _HomeScreenState extends State<HomeScreen>
     ]);
     await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
     if (!mounted) return;
+    final live = _current?.kind == Kind.live;
+    final hasQueue = _queue.isNotEmpty;
     await Navigator.of(context).push(
       MaterialPageRoute(
-        builder: (_) => _FullScreen(controller: _controller, player: _player),
+        builder: (_) => _FullScreen(
+          controller: _controller,
+          player: _player,
+          title: _title,
+          isLive: live,
+          onNext: hasQueue ? _nextEp : null,
+          onPrev: hasQueue ? _prevEp : null,
+        ),
       ),
     );
     await SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
@@ -209,6 +243,8 @@ class _HomeScreenState extends State<HomeScreen>
                           title: Text(ep.name),
                           onTap: () async {
                             Navigator.of(ctx).pop();
+                            _queue = eps;
+                            _qi = i;
                             await _play(ep);
                             await _enterFull();
                           },
@@ -304,8 +340,9 @@ class _HomeScreenState extends State<HomeScreen>
                   itemCount: shown.length,
                   itemBuilder: (context, index) {
                     final it = shown[index];
-                    final playing =
-                        _current != null && _current!.id == it.id && _current!.kind == it.kind;
+                    final playing = _current != null &&
+                        _current!.id == it.id &&
+                        _current!.kind == it.kind;
                     return InkWell(
                       onTap: () => _select(it),
                       onDoubleTap: () => _select(it, full: true),
@@ -324,10 +361,8 @@ class _HomeScreenState extends State<HomeScreen>
                                 overflow: TextOverflow.ellipsis,
                               ),
                             ),
-                            if (playing)
-                              const Icon(Icons.equalizer, size: 20),
-                            if (it.url.isEmpty)
-                              const Icon(Icons.chevron_right),
+                            if (playing) const Icon(Icons.equalizer, size: 20),
+                            if (it.url.isEmpty) const Icon(Icons.chevron_right),
                           ],
                         ),
                       ),
@@ -480,8 +515,19 @@ class _HomeScreenState extends State<HomeScreen>
 class _FullScreen extends StatefulWidget {
   final VideoController controller;
   final Player player;
+  final ValueNotifier<String> title;
+  final bool isLive;
+  final Future<void> Function()? onNext;
+  final Future<void> Function()? onPrev;
 
-  const _FullScreen({required this.controller, required this.player});
+  const _FullScreen({
+    required this.controller,
+    required this.player,
+    required this.title,
+    required this.isLive,
+    this.onNext,
+    this.onPrev,
+  });
 
   @override
   State<_FullScreen> createState() => _FullScreenState();
@@ -490,6 +536,141 @@ class _FullScreen extends StatefulWidget {
 class _FullScreenState extends State<_FullScreen> {
   bool _fill = true;
   bool _bar = true;
+  double? _drag;
+
+  String _fmt(Duration d) {
+    String two(int n) => n.toString().padLeft(2, '0');
+    final h = d.inHours;
+    final m = d.inMinutes.remainder(60);
+    final s = d.inSeconds.remainder(60);
+    return h > 0 ? '$h:${two(m)}:${two(s)}' : '${two(m)}:${two(s)}';
+  }
+
+  Future<void> _seekBy(Duration delta) async {
+    final pos = widget.player.state.position;
+    final total = widget.player.state.duration;
+    var t = pos + delta;
+    if (t < Duration.zero) t = Duration.zero;
+    if (total > Duration.zero && t > total) t = total;
+    await widget.player.seek(t);
+  }
+
+  Future<void> _chapter(int n) async {
+    try {
+      await (widget.player.platform as dynamic).command(['add', 'chapter', '$n']);
+    } catch (_) {}
+  }
+
+  Widget _btn(IconData icon, String label, VoidCallback? onTap) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 2),
+      child: TextButton.icon(
+        style: TextButton.styleFrom(foregroundColor: Colors.white),
+        onPressed: onTap,
+        icon: Icon(icon, size: 20),
+        label: Text(label),
+      ),
+    );
+  }
+
+  Widget _seekBar() {
+    return StreamBuilder<Duration>(
+      stream: widget.player.stream.duration,
+      initialData: widget.player.state.duration,
+      builder: (context, dsnap) {
+        final total = dsnap.data ?? Duration.zero;
+        return StreamBuilder<Duration>(
+          stream: widget.player.stream.position,
+          initialData: widget.player.state.position,
+          builder: (context, psnap) {
+            final pos = psnap.data ?? Duration.zero;
+            final maxMs = total.inMilliseconds <= 0
+                ? 1.0
+                : total.inMilliseconds.toDouble();
+            final cur = (_drag ?? pos.inMilliseconds.toDouble())
+                .clamp(0.0, maxMs)
+                .toDouble();
+            return Row(
+              children: [
+                Text(
+                  _fmt(Duration(milliseconds: cur.toInt())),
+                  style: const TextStyle(color: Colors.white),
+                ),
+                Expanded(
+                  child: Slider(
+                    min: 0,
+                    max: maxMs,
+                    value: cur,
+                    onChanged: (v) => setState(() => _drag = v),
+                    onChangeEnd: (v) async {
+                      await widget.player
+                          .seek(Duration(milliseconds: v.toInt()));
+                      if (mounted) setState(() => _drag = null);
+                    },
+                  ),
+                ),
+                Text(
+                  _fmt(total),
+                  style: const TextStyle(color: Colors.white),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Widget _playButton() {
+    return StreamBuilder<bool>(
+      stream: widget.player.stream.playing,
+      initialData: widget.player.state.playing,
+      builder: (context, snap) {
+        final playing = snap.data ?? false;
+        return IconButton(
+          iconSize: 40,
+          color: Colors.white,
+          icon: Icon(playing ? Icons.pause_circle : Icons.play_circle),
+          onPressed: () => widget.player.playOrPause(),
+        );
+      },
+    );
+  }
+
+  Widget _bottom() {
+    if (widget.isLive) {
+      return Center(child: _playButton());
+    }
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        _seekBar(),
+        SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              if (widget.onPrev != null)
+                _btn(Icons.skip_previous, 'Ep.', () => widget.onPrev!()),
+              _btn(Icons.fast_rewind, 'Cap.', () => _chapter(-1)),
+              _btn(Icons.replay, '-5 min',
+                  () => _seekBy(const Duration(minutes: -5))),
+              _btn(Icons.replay_10, '-10 s',
+                  () => _seekBy(const Duration(seconds: -10))),
+              _playButton(),
+              _btn(Icons.forward_10, '+10 s',
+                  () => _seekBy(const Duration(seconds: 10))),
+              _btn(Icons.update, '+5 min',
+                  () => _seekBy(const Duration(minutes: 5))),
+              _btn(Icons.fast_forward, 'Cap.', () => _chapter(1)),
+              if (widget.onNext != null)
+                _btn(Icons.skip_next, 'Ep.', () => widget.onNext!()),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -511,27 +692,49 @@ class _FullScreenState extends State<_FullScreen> {
           ),
           if (_bar)
             Positioned(
-              top: 8,
-              left: 8,
-              right: 8,
-              child: Row(
-                children: [
-                  IconButton(
-                    color: Colors.white,
-                    icon: const Icon(Icons.arrow_back),
-                    onPressed: () => Navigator.of(context).pop(),
-                  ),
-                  const Spacer(),
-                  TextButton(
-                    onPressed: () => setState(() => _fill = !_fill),
-                    child: Text(_fill ? 'Preencher' : 'Original'),
-                  ),
-                  IconButton(
-                    color: Colors.white,
-                    icon: const Icon(Icons.play_arrow),
-                    onPressed: () => widget.player.playOrPause(),
-                  ),
-                ],
+              top: 0,
+              left: 0,
+              right: 0,
+              child: Container(
+                color: Colors.black54,
+                padding: const EdgeInsets.fromLTRB(8, 8, 8, 4),
+                child: Row(
+                  children: [
+                    IconButton(
+                      color: Colors.white,
+                      icon: const Icon(Icons.arrow_back),
+                      onPressed: () => Navigator.of(context).pop(),
+                    ),
+                    Expanded(
+                      child: ValueListenableBuilder<String>(
+                        valueListenable: widget.title,
+                        builder: (context, t, _) => Text(
+                          t,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(color: Colors.white),
+                        ),
+                      ),
+                    ),
+                    TextButton(
+                      style: TextButton.styleFrom(
+                          foregroundColor: Colors.white),
+                      onPressed: () => setState(() => _fill = !_fill),
+                      child: Text(_fill ? 'Preencher' : 'Original'),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          if (_bar)
+            Positioned(
+              bottom: 0,
+              left: 0,
+              right: 0,
+              child: Container(
+                color: Colors.black54,
+                padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+                child: _bottom(),
               ),
             ),
         ],

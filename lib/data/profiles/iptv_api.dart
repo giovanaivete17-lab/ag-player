@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:isolate';
 import 'package:dio/dio.dart';
 import '../../domain/entities/channel.dart';
 import '../parsers/m3u_parser.dart';
@@ -36,40 +37,129 @@ class Catalog {
   });
 }
 
+class IptvException implements Exception {
+  final String message;
+  const IptvException(this.message);
+
+  @override
+  String toString() => message;
+}
+
 class IptvApi {
+  /// Formato do canal ao vivo: 'ts' ou 'm3u8'.
+  static String liveExt = 'ts';
+
   static final Dio _dio = Dio(BaseOptions(
-    connectTimeout: const Duration(seconds: 20),
-    receiveTimeout: const Duration(seconds: 90),
+    connectTimeout: const Duration(seconds: 25),
+    receiveTimeout: const Duration(seconds: 120),
     headers: {'User-Agent': 'VLC/3.0.18 LibVLC/3.0.18'},
   ));
 
-  static String _s(dynamic v) => v == null ? '' : v.toString();
+  static String _s(dynamic v) => v == null ? '' : v.toString().trim();
 
-  static String _xBase(String raw) {
+  static String _fixUrl(String raw) {
     var b = raw.trim();
     if (!b.startsWith('http://') && !b.startsWith('https://')) {
       b = 'http://$b';
     }
-    final uri = Uri.parse(b);
+    return b;
+  }
+
+  static String _xBase(String raw) {
+    final uri = Uri.parse(_fixUrl(raw));
     final port = uri.hasPort ? ':${uri.port}' : '';
     return '${uri.scheme}://${uri.host}$port';
   }
 
+  static String _dioMsg(DioException e) {
+    final code = e.response?.statusCode;
+    if (code != null) {
+      return 'O servidor recusou o acesso (código $code). '
+          'Confira endereço, usuário e senha.';
+    }
+    switch (e.type) {
+      case DioExceptionType.connectionTimeout:
+      case DioExceptionType.receiveTimeout:
+      case DioExceptionType.sendTimeout:
+        return 'O servidor demorou demais para responder. Tente de novo.';
+      case DioExceptionType.connectionError:
+        return 'Sem conexão com o servidor. Confira o endereço e a internet.';
+      default:
+        return 'Falha ao acessar o servidor. Confira o endereço.';
+    }
+  }
+
+  static Future<dynamic> _decode(String text) async {
+    final t = text.trim();
+    if (t.isEmpty) return null;
+    try {
+      return await Isolate.run(() => jsonDecode(t));
+    } catch (_) {
+      return null;
+    }
+  }
+
   static Future<Catalog> load(Profile p) async {
-    if (p.type == 'xtream') return _loadXtream(p);
-    return _loadM3u(p);
+    try {
+      if (p.type == 'xtream') return await _loadXtream(p);
+
+      // Link M3U do tipo get.php?username=..&password=.. -> tenta como Xtream
+      try {
+        final uri = Uri.parse(_fixUrl(p.url));
+        final u = uri.queryParameters['username'];
+        final pw = uri.queryParameters['password'];
+        if (uri.path.contains('get.php') &&
+            u != null &&
+            u.isNotEmpty &&
+            pw != null &&
+            pw.isNotEmpty) {
+          final x = Profile(
+            id: p.id,
+            name: p.name,
+            type: 'xtream',
+            url: _xBase(p.url),
+            user: u,
+            pass: pw,
+          );
+          try {
+            return await _loadXtream(x);
+          } catch (_) {
+            // cai para a leitura normal do M3U
+          }
+        }
+      } catch (_) {}
+
+      return await _loadM3u(p);
+    } on DioException catch (e) {
+      throw IptvException(_dioMsg(e));
+    }
+  }
+
+  // ---------------- M3U ----------------
+
+  static bool _isVodFile(String url) {
+    final path = url.toLowerCase().split('?').first;
+    return path.endsWith('.mp4') ||
+        path.endsWith('.mkv') ||
+        path.endsWith('.avi') ||
+        path.endsWith('.mov') ||
+        path.endsWith('.wmv') ||
+        path.endsWith('.flv');
   }
 
   static Future<Catalog> _loadM3u(Profile p) async {
-    var u = p.url.trim();
-    if (!u.startsWith('http://') && !u.startsWith('https://')) {
-      u = 'http://$u';
-    }
     final res = await _dio.get<String>(
-      u,
+      _fixUrl(p.url),
       options: Options(responseType: ResponseType.plain),
     );
-    final text = res.data ?? '';
+    var text = res.data ?? '';
+    if (text.startsWith('\uFEFF')) text = text.substring(1);
+
+    if (!text.contains('#EXTM3U') && !text.contains('#EXTINF')) {
+      throw const IptvException(
+          'O link não retornou uma lista M3U válida. Confira o endereço.');
+    }
+
     final List<Channel> channels = await M3uParser.parse(text);
 
     final live = <Item>[];
@@ -79,19 +169,28 @@ class IptvApi {
     for (final c in channels) {
       final String? g = c.group;
       final String? logo = c.logo;
-      final cat = (g == null || g.isEmpty) ? 'Sem categoria' : g;
-      final lower = c.url.toLowerCase();
+      final cat = (g == null || g.trim().isEmpty) ? 'Sem categoria' : g.trim();
+      final lowerUrl = c.url.toLowerCase();
+      final lowerCat = cat.toLowerCase();
+
       Kind kind = Kind.live;
-      if (lower.contains('/movie/')) {
+      if (lowerUrl.contains('/movie/')) {
         kind = Kind.movie;
-      } else if (lower.contains('/series/')) {
+      } else if (lowerUrl.contains('/series/')) {
         kind = Kind.series;
+      } else if (_isVodFile(c.url)) {
+        final isSerie = lowerCat.contains('serie') ||
+            lowerCat.contains('séri') ||
+            lowerCat.contains('season') ||
+            lowerCat.contains('temporada');
+        kind = isSerie ? Kind.series : Kind.movie;
       }
+
       final item = Item(
         id: c.url,
-        name: c.name,
+        name: c.name.trim(),
         url: c.url,
-        logo: (logo == null || logo.isEmpty) ? null : logo,
+        logo: (logo == null || logo.trim().isEmpty) ? null : logo.trim(),
         category: cat,
         kind: kind,
       );
@@ -105,34 +204,55 @@ class IptvApi {
     }
 
     if (live.isEmpty && movies.isEmpty && series.isEmpty) {
-      throw Exception('Nenhum canal encontrado nessa lista.');
+      throw const IptvException('Nenhum canal encontrado nessa lista.');
     }
     return Catalog(live: live, movies: movies, series: series);
+  }
+
+  // ---------------- Xtream ----------------
+
+  static Future<void> _auth(String base, Profile p) async {
+    dynamic data;
+    try {
+      final res = await _dio.get<String>(
+        '$base/player_api.php',
+        queryParameters: {'username': p.user, 'password': p.pass},
+        options: Options(responseType: ResponseType.plain),
+      );
+      data = await _decode(res.data ?? '');
+    } on DioException {
+      return;
+    }
+    if (data is Map) {
+      final ui = data['user_info'];
+      if (ui is Map) {
+        if (_s(ui['auth']) == '0') {
+          throw const IptvException('Usuário ou senha inválidos.');
+        }
+        final st = _s(ui['status']);
+        if (st.isNotEmpty && st.toLowerCase() != 'active') {
+          throw IptvException('Conta $st. Fale com seu fornecedor.');
+        }
+      }
+    }
   }
 
   static Future<List<dynamic>> _getList(
     String base,
     Profile p,
-    String action, {
-    Map<String, String>? extra,
-  }) async {
-    final res = await _dio.get<dynamic>(
+    String action,
+  ) async {
+    final res = await _dio.get<String>(
       '$base/player_api.php',
       queryParameters: {
         'username': p.user,
         'password': p.pass,
         'action': action,
-        if (extra != null) ...extra,
       },
+      options: Options(responseType: ResponseType.plain),
     );
-    final data = res.data;
+    final data = await _decode(res.data ?? '');
     if (data is List) return data;
-    if (data is String) {
-      try {
-        final d = jsonDecode(data);
-        if (d is List) return d;
-      } catch (_) {}
-    }
     return <dynamic>[];
   }
 
@@ -146,8 +266,15 @@ class IptvApi {
     return m;
   }
 
+  static String _catName(Map<String, String> cats, dynamic id) {
+    final n = cats[_s(id)];
+    return (n == null || n.isEmpty) ? 'Sem categoria' : n;
+  }
+
   static Future<Catalog> _loadXtream(Profile p) async {
     final base = _xBase(p.url);
+    await _auth(base, p);
+
     Object? err;
 
     Future<List<dynamic>> safe(String action) async {
@@ -171,8 +298,8 @@ class IptvApi {
     if (r[3].isEmpty && r[4].isEmpty && r[5].isEmpty) {
       final e = err;
       if (e != null) throw e;
-      throw Exception(
-          'O servidor não retornou nada. Confira endereço, usuário e senha.');
+      throw const IptvException(
+          'O servidor não retornou canais. Confira endereço, usuário e senha.');
     }
 
     final liveCats = _cats(r[0]);
@@ -183,13 +310,14 @@ class IptvApi {
     for (final e in r[3]) {
       if (e is! Map) continue;
       final id = _s(e['stream_id']);
+      if (id.isEmpty) continue;
       final icon = _s(e['stream_icon']);
       live.add(Item(
         id: id,
         name: _s(e['name']),
-        url: '$base/live/${p.user}/${p.pass}/$id.ts',
+        url: '$base/live/${p.user}/${p.pass}/$id.$liveExt',
         logo: icon.isEmpty ? null : icon,
-        category: liveCats[_s(e['category_id'])] ?? 'Sem categoria',
+        category: _catName(liveCats, e['category_id']),
         kind: Kind.live,
       ));
     }
@@ -198,6 +326,7 @@ class IptvApi {
     for (final e in r[4]) {
       if (e is! Map) continue;
       final id = _s(e['stream_id']);
+      if (id.isEmpty) continue;
       final icon = _s(e['stream_icon']);
       var ext = _s(e['container_extension']);
       if (ext.isEmpty) ext = 'mp4';
@@ -206,7 +335,7 @@ class IptvApi {
         name: _s(e['name']),
         url: '$base/movie/${p.user}/${p.pass}/$id.$ext',
         logo: icon.isEmpty ? null : icon,
-        category: vodCats[_s(e['category_id'])] ?? 'Sem categoria',
+        category: _catName(vodCats, e['category_id']),
         kind: Kind.movie,
       ));
     }
@@ -214,13 +343,15 @@ class IptvApi {
     final series = <Item>[];
     for (final e in r[5]) {
       if (e is! Map) continue;
+      final id = _s(e['series_id']);
+      if (id.isEmpty) continue;
       final cover = _s(e['cover']);
       series.add(Item(
-        id: _s(e['series_id']),
+        id: id,
         name: _s(e['name']),
         url: '',
         logo: cover.isEmpty ? null : cover,
-        category: serCats[_s(e['category_id'])] ?? 'Sem categoria',
+        category: _catName(serCats, e['category_id']),
         kind: Kind.series,
       ));
     }
@@ -231,7 +362,7 @@ class IptvApi {
   /// Episódios de uma série Xtream.
   static Future<List<Item>> episodes(Profile p, Item serie) async {
     final base = _xBase(p.url);
-    final res = await _dio.get<dynamic>(
+    final res = await _dio.get<String>(
       '$base/player_api.php',
       queryParameters: {
         'username': p.user,
@@ -239,13 +370,9 @@ class IptvApi {
         'action': 'get_series_info',
         'series_id': serie.id,
       },
+      options: Options(responseType: ResponseType.plain),
     );
-    dynamic data = res.data;
-    if (data is String) {
-      try {
-        data = jsonDecode(data);
-      } catch (_) {}
-    }
+    final data = await _decode(res.data ?? '');
     final out = <Item>[];
     if (data is! Map) return out;
     final eps = data['episodes'];
@@ -268,6 +395,7 @@ class IptvApi {
     for (final e in flat) {
       if (e is! Map) continue;
       final id = _s(e['id']);
+      if (id.isEmpty) continue;
       var ext = _s(e['container_extension']);
       if (ext.isEmpty) ext = 'mp4';
       final season = _s(e['season']);

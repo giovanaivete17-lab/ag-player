@@ -1,535 +1,541 @@
-import 'dart:io';
-import 'package:dio/dio.dart';
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
-import '../../data/parsers/m3u_parser.dart';
-import '../../data/xtream/xtream_client.dart';
-import '../../domain/entities/channel.dart';
-import '../../services/player_service.dart';
-import '../../services/download_service.dart';
+import '../../data/profiles/iptv_api.dart';
+import '../../data/profiles/profile.dart';
+import 'profiles_screen.dart';
 
-final playerProvider = Provider<PlayerService>((ref) {
-  final service = PlayerService();
-  ref.onDispose(service.dispose);
-  return service;
-});
+const _headers = {'User-Agent': 'VLC/3.0.18 LibVLC/3.0.18'};
 
-class HomeScreen extends ConsumerStatefulWidget {
+class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
 
   @override
-  ConsumerState<HomeScreen> createState() => _HomeScreenState();
+  State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends ConsumerState<HomeScreen> {
-  final _url = TextEditingController();
-  final _host = TextEditingController();
-  final _username = TextEditingController();
-  final _password = TextEditingController();
-  final _search = TextEditingController();
-  final _urlFocus = FocusNode();
-  final _importFocus = FocusNode();
-  final _loginFocus = FocusNode();
+class _HomeScreenState extends State<HomeScreen>
+    with SingleTickerProviderStateMixin {
+  late final Player _player = Player();
+  late final VideoController _controller = VideoController(_player);
+  late final TabController _tabs = TabController(length: 3, vsync: this);
+  final TextEditingController _search = TextEditingController();
 
-  List<Channel> _channels = [];
-  List<Channel> _visible = [];
-  Channel? _selected;
-  bool _loading = false;
-  bool _downloading = false;
-  double _downloadProgress = 0;
-  String _downloadStatus = '';
-  final _downloadUrl = TextEditingController();
-  final _downloadName = TextEditingController();
-  final _downloadService = EpisodeDownloadService();
-  String _status = 'Adicione uma lista M3U ou entre com Xtream Codes.';
-  String _category = 'Todos';
-  String _aspect = 'Original';
+  Profile? _profile;
+  Catalog? _catalog;
+  bool _loading = true;
+  String? _error;
+  bool _full = false;
+  Item? _current;
 
-  PlayerService get _player => ref.read(playerProvider);
-  late final VideoController _videoController;
+  final Map<Kind, String?> _cat = {
+    Kind.live: null,
+    Kind.movie: null,
+    Kind.series: null,
+  };
+  final Map<Kind, List<String>> _cats = {
+    Kind.live: <String>[],
+    Kind.movie: <String>[],
+    Kind.series: <String>[],
+  };
 
   @override
   void initState() {
     super.initState();
-    _videoController = VideoController(_player.player);
+    _init();
   }
 
   @override
   void dispose() {
-    _url.dispose();
-    _host.dispose();
-    _username.dispose();
-    _password.dispose();
+    _player.dispose();
+    _tabs.dispose();
     _search.dispose();
-    _downloadUrl.dispose();
-    _downloadName.dispose();
-    _urlFocus.dispose();
-    _importFocus.dispose();
-    _loginFocus.dispose();
     super.dispose();
   }
 
-  Future<void> _loadM3u(String content) async {
-    setState(() {
-      _loading = true;
-      _status = 'Processando lista em segundo plano...';
-    });
-    try {
-      final parsed = await M3uParser.parse(content);
-      if (!mounted) return;
-      setState(() {
-        _channels = parsed;
-        _visible = parsed;
-        _selected = null;
-        _loading = false;
-        _status = '${parsed.length} canais carregados.';
-      });
-    } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _loading = false;
-        _status = 'Falha ao processar lista: $e';
-      });
+  Future<void> _init() async {
+    final list = await ProfileStore.load();
+    final id = await ProfileStore.activeId();
+    Profile? active;
+    for (final p in list) {
+      if (p.id == id) active = p;
     }
-  }
-
-  Future<void> _loadUrl() async {
-    final value = _url.text.trim();
-    if (value.isEmpty) return;
-    setState(() => _loading = true);
-    try {
-      final response = await Dio().get<String>(
-        value,
-        options: Options(responseType: ResponseType.plain),
-      );
-      await _loadM3u(response.data ?? '');
-    } catch (e) {
+    if (active == null) {
       if (!mounted) return;
-      setState(() {
-        _loading = false;
-        _status = 'Não foi possível baixar a lista: $e';
-      });
-    }
-  }
-
-  Future<void> _loadFile() async {
-    final result = await FilePicker.platform.pickFiles(
-      type: FileType.custom,
-      allowedExtensions: ['m3u', 'm3u8', 'txt'],
-      withData: true,
-    );
-    if (result == null) return;
-    final file = result.files.single;
-    final bytes = file.bytes ??
-        (file.path != null ? await File(file.path!).readAsBytes() : null);
-    if (bytes == null) return;
-    await _loadM3u(String.fromCharCodes(bytes));
-  }
-
-  Future<void> _loginXtream() async {
-    if (_host.text.trim().isEmpty ||
-        _username.text.trim().isEmpty ||
-        _password.text.isEmpty) {
-      setState(() => _status = 'Preencha URL, usuário e senha.');
+      setState(() => _loading = false);
+      WidgetsBinding.instance.addPostFrameCallback((_) => _openProfiles());
       return;
     }
+    await _loadProfile(active);
+  }
+
+  String _friendly(Object e) {
+    final t = e.toString();
+    final short = t.length > 140 ? '${t.substring(0, 140)}...' : t;
+    if (t.contains('DioException')) {
+      return 'Não foi possível baixar a lista. Confira endereço, usuário e senha.\n\n$short';
+    }
+    return short;
+  }
+
+  List<String> _catsOf(List<Item> items) {
+    final s = <String>{};
+    for (final i in items) {
+      s.add(i.category);
+    }
+    final l = s.toList();
+    l.sort();
+    return l;
+  }
+
+  Future<void> _loadProfile(Profile p) async {
     setState(() {
+      _profile = p;
       _loading = true;
-      _status = 'Validando acesso Xtream...';
+      _error = null;
+      _catalog = null;
+      _cat[Kind.live] = null;
+      _cat[Kind.movie] = null;
+      _cat[Kind.series] = null;
     });
     try {
-      final client = XtreamClient(
-        host: _host.text,
-        username: _username.text,
-        password: _password.text,
-      );
-      await client.authenticate();
-      final data = await client.liveStreams();
-      final parsed = data.map((item) {
-        final map = Map<String, dynamic>.from(item as Map);
-        final id = map['stream_id'];
-        final extension = (map['container_extension'] ?? 'ts').toString();
-        final base = _host.text.trim().replaceAll(RegExp(r'/+$'), '');
-        final url = '$base/live/${Uri.encodeComponent(_username.text.trim())}/'
-            '${Uri.encodeComponent(_password.text)}/$id.$extension';
-        return Channel(
-          name: (map['name'] ?? 'Canal $id').toString(),
-          url: url,
-          tvgId: map['epg_channel_id']?.toString(),
-          logo: map['stream_icon']?.toString(),
-          group: map['category_id']?.toString(),
+      final c = await IptvApi.load(p);
+      if (!mounted) return;
+      _cats[Kind.live] = _catsOf(c.live);
+      _cats[Kind.movie] = _catsOf(c.movies);
+      _cats[Kind.series] = _catsOf(c.series);
+      setState(() {
+        _catalog = c;
+        _loading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = _friendly(e);
+        _loading = false;
+      });
+    }
+  }
+
+  Future<void> _openProfiles() async {
+    if (!mounted) return;
+    final p = await Navigator.of(context).push<Profile>(
+      MaterialPageRoute(builder: (_) => const ProfilesScreen()),
+    );
+    if (p != null) {
+      await _player.stop();
+      if (!mounted) return;
+      setState(() => _current = null);
+      await _loadProfile(p);
+    }
+  }
+
+  Future<void> _play(Item it) async {
+    setState(() => _current = it);
+    await _player.open(Media(it.url, httpHeaders: _headers));
+  }
+
+  Future<void> _select(Item it, {bool full = false}) async {
+    if (it.url.isEmpty) {
+      _openSeries(it);
+      return;
+    }
+    await _play(it);
+    if (full) await _enterFull();
+  }
+
+  Future<void> _enterFull() async {
+    if (_full || !mounted) return;
+    setState(() => _full = true);
+    await SystemChrome.setPreferredOrientations([
+      DeviceOrientation.landscapeLeft,
+      DeviceOrientation.landscapeRight,
+    ]);
+    await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    if (!mounted) return;
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => _FullScreen(controller: _controller, player: _player),
+      ),
+    );
+    await SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
+    await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    if (mounted) setState(() => _full = false);
+  }
+
+  void _openSeries(Item serie) {
+    final p = _profile;
+    if (p == null) return;
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      builder: (ctx) {
+        return SizedBox(
+          height: MediaQuery.of(ctx).size.height * 0.7,
+          child: Column(
+            children: [
+              Padding(
+                padding: const EdgeInsets.all(16),
+                child: Text(
+                  serie.name,
+                  style: Theme.of(ctx).textTheme.titleMedium,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              Expanded(
+                child: FutureBuilder<List<Item>>(
+                  future: IptvApi.episodes(p, serie),
+                  builder: (c, snap) {
+                    if (snap.connectionState != ConnectionState.done) {
+                      return const Center(child: CircularProgressIndicator());
+                    }
+                    if (snap.hasError) {
+                      return const Center(
+                        child: Text('Não foi possível carregar os episódios.'),
+                      );
+                    }
+                    final eps = snap.data ?? <Item>[];
+                    if (eps.isEmpty) {
+                      return const Center(child: Text('Sem episódios.'));
+                    }
+                    return ListView.builder(
+                      itemCount: eps.length,
+                      itemBuilder: (c2, i) {
+                        final ep = eps[i];
+                        return ListTile(
+                          leading: const Icon(Icons.play_circle_outline),
+                          title: Text(ep.name),
+                          onTap: () async {
+                            Navigator.of(ctx).pop();
+                            await _play(ep);
+                            await _enterFull();
+                          },
+                        );
+                      },
+                    );
+                  },
+                ),
+              ),
+            ],
+          ),
         );
-      }).toList();
-      if (!mounted) return;
-      setState(() {
-        _channels = parsed;
-        _visible = parsed;
-        _selected = null;
-        _loading = false;
-        _status = '${parsed.length} canais ao vivo carregados via Xtream.';
-      });
-    } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _loading = false;
-        _status = 'Falha no login Xtream: $e';
-      });
-    }
+      },
+    );
   }
 
-  Future<void> _play(Channel channel) async {
-    setState(() {
-      _selected = channel;
-      _status = 'Abrindo ${channel.name}...';
-    });
-    try {
-      await _player.play(channel.url);
-      if (mounted) setState(() => _status = 'Reproduzindo: ${channel.name}');
-    } catch (e) {
-      if (mounted) setState(() => _status = 'Erro ao reproduzir: $e');
-    }
+  List<Item> _itemsOf(Kind k) {
+    final c = _catalog;
+    if (c == null) return <Item>[];
+    return switch (k) {
+      Kind.live => c.live,
+      Kind.movie => c.movies,
+      Kind.series => c.series,
+    };
   }
 
-  void _filter(String value) {
-    final query = value.toLowerCase();
-    setState(() {
-      _visible = _channels.where((c) =>
-        c.name.toLowerCase().contains(query) ||
-        (c.group ?? '').toLowerCase().contains(query)
-      ).toList();
-    });
+  Widget _thumb(Item it) {
+    final fallback = Container(
+      width: 48,
+      height: 48,
+      color: Colors.white10,
+      child: Icon(it.kind == Kind.live ? Icons.live_tv : Icons.movie, size: 22),
+    );
+    final logo = it.logo;
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(8),
+      child: logo == null
+          ? fallback
+          : Image.network(
+              logo,
+              width: 48,
+              height: 48,
+              fit: BoxFit.cover,
+              cacheWidth: 120,
+              errorBuilder: (_, __, ___) => fallback,
+            ),
+    );
+  }
+
+  Widget _tabBody(Kind k) {
+    final all = _itemsOf(k);
+    final cats = _cats[k] ?? <String>[];
+    final sel = _cat[k];
+    final q = _search.text.trim().toLowerCase();
+    final shown = all.where((i) {
+      final okCat = sel == null || i.category == sel;
+      final okQ = q.isEmpty || i.name.toLowerCase().contains(q);
+      return okCat && okQ;
+    }).toList();
+
+    return Column(
+      children: [
+        SizedBox(
+          height: 46,
+          child: ListView(
+            scrollDirection: Axis.horizontal,
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            children: [
+              Padding(
+                padding: const EdgeInsets.only(right: 8),
+                child: ChoiceChip(
+                  label: const Text('Todos'),
+                  selected: sel == null,
+                  onSelected: (_) => setState(() => _cat[k] = null),
+                ),
+              ),
+              for (final c in cats)
+                Padding(
+                  padding: const EdgeInsets.only(right: 8),
+                  child: ChoiceChip(
+                    label: Text(c),
+                    selected: sel == c,
+                    onSelected: (_) => setState(() => _cat[k] = c),
+                  ),
+                ),
+            ],
+          ),
+        ),
+        Expanded(
+          child: shown.isEmpty
+              ? const Center(child: Text('Nada encontrado.'))
+              : ListView.builder(
+                  itemCount: shown.length,
+                  itemBuilder: (context, index) {
+                    final it = shown[index];
+                    final playing =
+                        _current != null && _current!.id == it.id && _current!.kind == it.kind;
+                    return InkWell(
+                      onTap: () => _select(it),
+                      onDoubleTap: () => _select(it, full: true),
+                      child: Container(
+                        color: playing ? Colors.white10 : null,
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 16, vertical: 8),
+                        child: Row(
+                          children: [
+                            _thumb(it),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: Text(
+                                it.name,
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                            if (playing)
+                              const Icon(Icons.equalizer, size: 20),
+                            if (it.url.isEmpty)
+                              const Icon(Icons.chevron_right),
+                          ],
+                        ),
+                      ),
+                    );
+                  },
+                ),
+        ),
+      ],
+    );
+  }
+
+  Widget _videoArea() {
+    final cur = _current;
+    return AspectRatio(
+      aspectRatio: 16 / 9,
+      child: Container(
+        color: Colors.black,
+        child: (cur == null || _full)
+            ? Center(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.live_tv, size: 48),
+                    const SizedBox(height: 8),
+                    Text(
+                      cur == null ? 'SELECIONE UM CANAL' : cur.name,
+                      textAlign: TextAlign.center,
+                    ),
+                  ],
+                ),
+              )
+            : GestureDetector(
+                onDoubleTap: _enterFull,
+                child: Video(
+                  controller: _controller,
+                  controls: NoVideoControls,
+                ),
+              ),
+      ),
+    );
+  }
+
+  Widget _body() {
+    if (_loading) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (_error != null) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(_error!, textAlign: TextAlign.center),
+              const SizedBox(height: 16),
+              FilledButton(
+                onPressed: () {
+                  final p = _profile;
+                  if (p != null) _loadProfile(p);
+                },
+                child: const Text('Tentar de novo'),
+              ),
+              TextButton(
+                onPressed: _openProfiles,
+                child: const Text('Trocar lista'),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+    final c = _catalog;
+    if (c == null) {
+      return Center(
+        child: FilledButton.icon(
+          onPressed: _openProfiles,
+          icon: const Icon(Icons.playlist_add),
+          label: const Text('Escolher ou adicionar lista'),
+        ),
+      );
+    }
+    return Column(
+      children: [
+        TabBar(
+          controller: _tabs,
+          tabs: [
+            Tab(text: 'Ao vivo (${c.live.length})'),
+            Tab(text: 'Filmes (${c.movies.length})'),
+            Tab(text: 'Séries (${c.series.length})'),
+          ],
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+          child: TextField(
+            controller: _search,
+            onChanged: (_) => setState(() {}),
+            decoration: const InputDecoration(
+              prefixIcon: Icon(Icons.search),
+              hintText: 'Buscar',
+              isDense: true,
+              border: OutlineInputBorder(),
+            ),
+          ),
+        ),
+        Expanded(
+          child: TabBarView(
+            controller: _tabs,
+            children: [
+              _tabBody(Kind.live),
+              _tabBody(Kind.movie),
+              _tabBody(Kind.series),
+            ],
+          ),
+        ),
+      ],
+    );
   }
 
   @override
   Widget build(BuildContext context) {
-    final isWide = MediaQuery.sizeOf(context).width > 800;
     return Scaffold(
       appBar: AppBar(
-        title: const Text('AG PLAYER',
-          style: TextStyle(fontWeight: FontWeight.w900, letterSpacing: 2)),
+        title: Text(_profile?.name ?? 'AG PLAYER'),
         actions: [
           IconButton(
-            tooltip: 'Baixar episódio',
-            onPressed: _showDownloadDialog,
-            icon: const Icon(Icons.download_for_offline_outlined),
+            tooltip: 'Listas',
+            icon: const Icon(Icons.playlist_play),
+            onPressed: _openProfiles,
           ),
           IconButton(
-            tooltip: 'Parar reprodução',
-            onPressed: _player.stop,
-            icon: const Icon(Icons.stop_circle_outlined),
+            tooltip: 'Atualizar',
+            icon: const Icon(Icons.refresh),
+            onPressed: () {
+              final p = _profile;
+              if (p != null) _loadProfile(p);
+            },
           ),
-          const SizedBox(width: 12),
         ],
       ),
-      body: SafeArea(
-        child: Column(
-          children: [
-            _statusBar(),
-            Expanded(
-              child: isWide
-                ? Row(children: [
-                    SizedBox(width: 340, child: _sourcesPanel()),
-                    Expanded(child: _contentPanel()),
-                  ])
-                : Column(children: [
-                    SizedBox(height: 250, child: _videoPanel()),
-                    Expanded(child: _channelPanel()),
-                    _compactSources(),
-                  ]),
+      body: Column(
+        children: [
+          _videoArea(),
+          Expanded(child: _body()),
+        ],
+      ),
+    );
+  }
+}
+
+class _FullScreen extends StatefulWidget {
+  final VideoController controller;
+  final Player player;
+
+  const _FullScreen({required this.controller, required this.player});
+
+  @override
+  State<_FullScreen> createState() => _FullScreenState();
+}
+
+class _FullScreenState extends State<_FullScreen> {
+  bool _fill = true;
+  bool _bar = true;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: Stack(
+        children: [
+          Positioned.fill(
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: () => setState(() => _bar = !_bar),
+              onDoubleTap: () => Navigator.of(context).pop(),
+              child: Video(
+                controller: widget.controller,
+                controls: NoVideoControls,
+                fit: _fill ? BoxFit.cover : BoxFit.contain,
+              ),
             ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Future<void> _showDownloadDialog() async {
-    _downloadUrl.clear();
-    _downloadName.clear();
-    await showDialog<void>(
-      context: context,
-      builder: (dialogContext) => AlertDialog(
-        title: const Text('Baixar episódio'),
-        content: SizedBox(
-          width: 420,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(
-                controller: _downloadName,
-                decoration: const InputDecoration(
-                  labelText: 'Nome do episódio',
-                  hintText: 'Série - Temporada 1 - Episódio 1',
-                ),
-              ),
-              const SizedBox(height: 10),
-              TextField(
-                controller: _downloadUrl,
-                keyboardType: TextInputType.url,
-                decoration: const InputDecoration(
-                  labelText: 'URL direta do episódio',
-                  hintText: 'https://servidor/episodio.mp4',
-                ),
-              ),
-              if (_downloading) ...[
-                const SizedBox(height: 16),
-                LinearProgressIndicator(value: _downloadProgress > 0
-                    ? _downloadProgress : null),
-                const SizedBox(height: 6),
-                Text(_downloadStatus,
-                    style: const TextStyle(fontSize: 12)),
-              ],
-              const SizedBox(height: 8),
-              const Text(
-                'O download fica salvo no armazenamento privado do aplicativo.',
-                style: TextStyle(color: Colors.white54, fontSize: 11),
-              ),
-            ],
           ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: _downloading ? null : () => Navigator.pop(dialogContext),
-            child: const Text('Fechar'),
-          ),
-          FilledButton.icon(
-            onPressed: _downloading ? null : () async {
-              final url = _downloadUrl.text.trim();
-              final name = _downloadName.text.trim();
-              if (url.isEmpty || name.isEmpty) {
-                setState(() => _downloadStatus = 'Informe o nome e a URL.');
-                return;
-              }
-              setState(() {
-                _downloading = true;
-                _downloadProgress = 0;
-                _downloadStatus = 'Iniciando download...';
-              });
-              try {
-                final path = await _downloadService.download(
-                  url: url,
-                  fileName: name,
-                  onProgress: (progress) {
-                    if (!mounted) return;
-                    setState(() {
-                      _downloadProgress = progress.fraction;
-                      _downloadStatus = progress.done
-                          ? 'Download concluído.'
-                          : progress.total > 0
-                              ? '${(progress.fraction * 100).toStringAsFixed(0)}% baixado'
-                              : 'Baixando episódio...';
-                    });
-                  },
-                );
-                if (!mounted) return;
-                setState(() {
-                  _downloading = false;
-                  _downloadStatus = 'Salvo em: $path';
-                });
-              } catch (e) {
-                if (!mounted) return;
-                setState(() {
-                  _downloading = false;
-                  _downloadStatus = 'Falha no download: $e';
-                });
-              }
-            },
-            icon: const Icon(Icons.download),
-            label: const Text('Baixar'),
-          ),
+          if (_bar)
+            Positioned(
+              top: 8,
+              left: 8,
+              right: 8,
+              child: Row(
+                children: [
+                  IconButton(
+                    color: Colors.white,
+                    icon: const Icon(Icons.arrow_back),
+                    onPressed: () => Navigator.of(context).pop(),
+                  ),
+                  const Spacer(),
+                  TextButton(
+                    onPressed: () => setState(() => _fill = !_fill),
+                    child: Text(_fill ? 'Preencher' : 'Original'),
+                  ),
+                  IconButton(
+                    color: Colors.white,
+                    icon: const Icon(Icons.play_arrow),
+                    onPressed: () => widget.player.playOrPause(),
+                  ),
+                ],
+              ),
+            ),
         ],
       ),
     );
   }
-  Widget _statusBar() => Container(
-    width: double.infinity,
-    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 9),
-    color: const Color(0xFF171C26),
-    child: Row(children: [
-      if (_loading)
-        const SizedBox(width: 16, height: 16,
-          child: CircularProgressIndicator(strokeWidth: 2)),
-      if (_loading) const SizedBox(width: 10),
-      Expanded(child: Text(_status,
-        maxLines: 1, overflow: TextOverflow.ellipsis,
-        style: const TextStyle(color: Color(0xFFD6AD55), fontSize: 12))),
-      Text('${_channels.length} canais',
-        style: const TextStyle(color: Colors.white54, fontSize: 12)),
-    ]),
-  );
-
-  Widget _sourcesPanel() => SingleChildScrollView(
-    padding: const EdgeInsets.all(16),
-    child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-      const Text('ADICIONAR LISTA',
-        style: TextStyle(fontWeight: FontWeight.bold, letterSpacing: 1.3)),
-      const SizedBox(height: 12),
-      TextField(
-        controller: _url,
-        focusNode: _urlFocus,
-        decoration: const InputDecoration(
-          labelText: 'URL da lista M3U',
-          prefixIcon: Icon(Icons.link),
-        ),
-        keyboardType: TextInputType.url,
-      ),
-      const SizedBox(height: 8),
-      _actionButton('Carregar URL M3U', Icons.download, _loadUrl,
-        focusNode: _importFocus),
-      OutlinedButton.icon(
-        onPressed: _loadFile,
-        icon: const Icon(Icons.folder_open),
-        label: const Text('Abrir arquivo M3U'),
-      ),
-      const Divider(height: 32),
-      const Text('XTREAM CODES',
-        style: TextStyle(fontWeight: FontWeight.bold, letterSpacing: 1.3)),
-      const SizedBox(height: 12),
-      TextField(controller: _host,
-        decoration: const InputDecoration(labelText: 'URL do servidor')),
-      const SizedBox(height: 8),
-      TextField(controller: _username,
-        decoration: const InputDecoration(labelText: 'Usuário')),
-      const SizedBox(height: 8),
-      TextField(controller: _password, obscureText: true,
-        decoration: const InputDecoration(labelText: 'Senha')),
-      const SizedBox(height: 12),
-      _actionButton('Entrar e carregar canais', Icons.login, _loginXtream,
-        focusNode: _loginFocus),
-      const SizedBox(height: 12),
-      const Text(
-        'Use somente credenciais e listas autorizadas. '
-        'A sessão não é enviada a nenhum serviço deste aplicativo.',
-        style: TextStyle(color: Colors.white38, fontSize: 11),
-      ),
-    ]),
-  );
-
-  Widget _contentPanel() => Column(children: [
-    Expanded(flex: 6, child: _videoPanel()),
-    Expanded(flex: 5, child: _channelPanel()),
-  ]);
-
-  Widget _videoPanel() => Container(
-    margin: const EdgeInsets.all(12),
-    decoration: BoxDecoration(
-      color: Colors.black,
-      borderRadius: BorderRadius.circular(18),
-      border: Border.all(color: const Color(0xFF34302A)),
-    ),
-    clipBehavior: Clip.antiAlias,
-    child: Stack(children: [
-      Positioned.fill(child: _selected == null
-        ? const Center(child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(Icons.live_tv, size: 54, color: Color(0xFFD6AD55)),
-              SizedBox(height: 12),
-              Text('SELECIONE UM CANAL',
-                style: TextStyle(letterSpacing: 2, color: Colors.white70)),
-            ],
-          ))
-        : Video(
-            controller: _videoController,
-            fit: BoxFit.contain,
-            controls: NoVideoControls,
-          )),
-      Positioned(
-        right: 8, bottom: 8,
-        child: PopupMenuButton<String>(
-          tooltip: 'Proporção da tela',
-          onSelected: (value) {
-            setState(() => _aspect = value);
-            _player.setAspect(value);
-          },
-          itemBuilder: (_) => const [
-            PopupMenuItem(value: 'Original', child: Text('Original')),
-            PopupMenuItem(value: '16:9', child: Text('16:9')),
-            PopupMenuItem(value: '4:3', child: Text('4:3')),
-          ],
-          child: Chip(label: Text(_aspect)),
-        ),
-      ),
-    ]),
-  );
-
-  Widget _channelPanel() => Column(children: [
-    Padding(
-      padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
-      child: TextField(
-        controller: _search,
-        onChanged: _filter,
-        decoration: const InputDecoration(
-          prefixIcon: Icon(Icons.search),
-          hintText: 'Buscar canal ou categoria',
-          isDense: true,
-        ),
-      ),
-    ),
-    Expanded(
-      child: _visible.isEmpty
-        ? const Center(child: Text('Nenhum canal carregado.'))
-        : ListView.builder(
-            itemCount: _visible.length,
-            itemBuilder: (context, index) {
-              final channel = _visible[index];
-              final selected = channel == _selected;
-              return Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
-                child: Focus(
-                  child: Builder(builder: (context) {
-                    final focused = Focus.of(context).hasFocus;
-                    return Material(
-                      color: selected
-                        ? const Color(0xFF39301E)
-                        : focused
-                          ? const Color(0xFF282D38)
-                          : Colors.transparent,
-                      borderRadius: BorderRadius.circular(10),
-                      child: ListTile(
-                        autofocus: false,
-                        dense: true,
-                        leading: channel.logo != null && channel.logo!.startsWith('http')
-                          ? CircleAvatar(
-                              backgroundColor: Colors.white10,
-                              backgroundImage: NetworkImage(channel.logo!),
-                            )
-                          : const CircleAvatar(
-                              backgroundColor: Color(0xFF292F3B),
-                              child: Icon(Icons.tv, color: Color(0xFFD6AD55)),
-                            ),
-                        title: Text(channel.name,
-                          maxLines: 1, overflow: TextOverflow.ellipsis),
-                        subtitle: channel.group == null
-                          ? null : Text(channel.group!,
-                              maxLines: 1, overflow: TextOverflow.ellipsis),
-                        trailing: selected
-                          ? const Icon(Icons.graphic_eq, color: Color(0xFFD6AD55))
-                          : null,
-                        onTap: () => _play(channel),
-                      ),
-                    );
-                  }),
-                ),
-              );
-            },
-          ),
-    ),
-  ]);
-
-  Widget _compactSources() => ExpansionTile(
-    title: const Text('Listas e acesso Xtream'),
-    children: [SizedBox(height: 420, child: _sourcesPanel())],
-  );
-
-  Widget _actionButton(String label, IconData icon, VoidCallback action,
-      {FocusNode? focusNode}) => FilledButton.icon(
-    focusNode: focusNode,
-    onPressed: _loading ? null : action,
-    icon: Icon(icon),
-    label: Text(label),
-  );
 }

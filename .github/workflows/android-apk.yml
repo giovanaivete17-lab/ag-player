@@ -1,0 +1,46 @@
+name: Gerar APK AG PLAYER
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar projeto
+        uses: actions/checkout@v4
+
+      - name: Preparar Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Instalar Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Gerar estrutura Android nativa
+        run: flutter create --platforms=android --org com.agplayer --project-name ag_player .
+
+      - name: Restaurar configurações Android do AG PLAYER
+        run: |
+          mkdir -p android/app/src/main
+          cp .github/android/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
+
+      - name: Baixar dependências
+        run: flutter pub get
+
+      - name: Compilar APK de teste
+        run: flutter build apk --release
+
+      - name: Disponibilizar APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: AG-PLAYER-APK
+          path: build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error

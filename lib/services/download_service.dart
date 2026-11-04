@@ -1,81 +1,115 @@
-import 'dart:async';
 import 'dart:io';
+import 'package:dio/dio.dart';
+import 'package:path_provider/path_provider.dart';
 
-class DownloadCancelled implements Exception {
-  @override
-  String toString() => 'Download cancelado';
+class DownloadProgress {
+  const DownloadProgress({
+    required this.name,
+    required this.received,
+    required this.total,
+    this.path,
+    this.error,
+    this.done = false,
+  });
+
+  final String name;
+  final int received;
+  final int total;
+  final String? path;
+  final String? error;
+  final bool done;
+
+  double get fraction => total > 0 ? received / total : 0;
 }
 
-class DownloadService {
-  final Map<String, HttpClient> _clients = {};
-  final Set<String> _cancelled = {};
+class EpisodeDownloadService {
+  EpisodeDownloadService() : _dio = Dio();
 
-  bool isDownloading(String url) => _clients.containsKey(url);
+  final Dio _dio;
+  final Map<String, CancelToken> _active = {};
 
-  /// Baixa [url] para [savePath].
-  /// [onProgress] recebe valores de 0.0 a 1.0.
-  Future<File> download({
+  Future<String> download({
     required String url,
-    required String savePath,
-    void Function(double progress)? onProgress,
+    required String fileName,
+    required void Function(DownloadProgress progress) onProgress,
   }) async {
-    final client = HttpClient();
-    _clients[url] = client;
-    _cancelled.remove(url);
+    final uri = Uri.tryParse(url);
+    if (uri == null ||
+        !(uri.scheme == 'https' || uri.scheme == 'http') ||
+        uri.host.isEmpty) {
+      throw const FormatException('URL de episódio inválida.');
+    }
 
-    final file = File(savePath);
-    await file.parent.create(recursive: true);
-    final sink = file.openWrite();
+    final safeName = _safeFileName(fileName);
+    final directory = await getApplicationDocumentsDirectory();
+    final folder = Directory('${directory.path}/AGPlayer/episodios');
+    await folder.create(recursive: true);
+
+    final extension = _extensionFromUrl(uri);
+    final finalName = safeName.toLowerCase().endsWith(extension)
+        ? safeName
+        : '$safeName$extension';
+    final destination = '${folder.path}/$finalName';
+    final token = CancelToken();
+    _active[finalName] = token;
 
     try {
-      final request = await client.getUrl(Uri.parse(url));
-      final response = await request.close();
+      await _dio.download(
+        url,
+        destination,
+        cancelToken: token,
+        deleteOnError: true,
+        options: Options(
+          followRedirects: true,
+          receiveTimeout: const Duration(minutes: 30),
+          sendTimeout: const Duration(seconds: 30),
+        ),
+        onReceiveProgress: (received, total) {
+          onProgress(DownloadProgress(
+            name: finalName,
+            received: received,
+            total: total,
+          ));
+        },
+      );
 
-      if (response.statusCode != 200) {
-        throw HttpException('Erro ${response.statusCode}', uri: Uri.parse(url));
-      }
-
-      final total = response.contentLength;
-      var received = 0;
-
-      await for (final chunk in response) {
-        if (_cancelled.contains(url)) {
-          throw DownloadCancelled();
-        }
-        sink.add(chunk);
-        received += chunk.length;
-        if (total > 0) {
-          onProgress?.call(received / total);
-        }
-      }
-
-      await sink.flush();
-      await sink.close();
-      onProgress?.call(1.0);
-      return file;
-    } catch (e) {
-      await sink.close();
-      if (await file.exists()) {
-        await file.delete();
-      }
-      rethrow;
+      onProgress(DownloadProgress(
+        name: finalName,
+        received: File(destination).lengthSync(),
+        total: File(destination).lengthSync(),
+        path: destination,
+        done: true,
+      ));
+      return destination;
     } finally {
-      client.close(force: true);
-      _clients.remove(url);
-      _cancelled.remove(url);
+      _active.remove(finalName);
     }
   }
 
-  void cancel(String url) {
-    if (_clients.containsKey(url)) {
-      _cancelled.add(url);
-      _clients[url]?.close(force: true);
-    }
+  void cancel(String fileName) {
+    _active[fileName]?.cancel('Download cancelado pelo usuário.');
   }
 
-  void cancelAll() {
-    for (final url in _clients.keys.toList()) {
-      cancel(url);
+  Future<List<FileSystemEntity>> listDownloads() async {
+    final directory = await getApplicationDocumentsDirectory();
+    final folder = Directory('${directory.path}/AGPlayer/episodios');
+    if (!await folder.exists()) return const [];
+    return folder.list().toList();
+  }
+
+  static String _safeFileName(String value) {
+    final cleaned = value
+        .replaceAll(RegExp(r'[\\/:*?"<>|]'), '_')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+    return cleaned.isEmpty ? 'episodio' : cleaned;
+  }
+
+  static String _extensionFromUrl(Uri uri) {
+    final path = uri.path.toLowerCase();
+    for (final ext in ['.mp4', '.mkv', '.avi', '.mov', '.ts', '.m4v']) {
+      if (path.endsWith(ext)) return ext;
     }
+    return '.mp4';
   }
 }

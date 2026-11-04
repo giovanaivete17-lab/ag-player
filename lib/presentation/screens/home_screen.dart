@@ -1,9 +1,12 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 import '../../data/profiles/iptv_api.dart';
 import '../../data/profiles/profile.dart';
+import '../../data/profiles/progress_store.dart';
 import 'profiles_screen.dart';
 
 const _headers = {'User-Agent': 'VLC/3.0.18 LibVLC/3.0.18'};
@@ -16,12 +19,17 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen>
-    with SingleTickerProviderStateMixin {
+    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
   late final Player _player = Player();
   late final VideoController _controller = VideoController(_player);
   late final TabController _tabs = TabController(length: 3, vsync: this);
   final TextEditingController _search = TextEditingController();
   final ValueNotifier<String> _title = ValueNotifier<String>('');
+  final ValueNotifier<bool> _buffering = ValueNotifier<bool>(false);
+  final ValueNotifier<String?> _err = ValueNotifier<String?>(null);
+  final List<StreamSubscription<dynamic>> _subs =
+      <StreamSubscription<dynamic>>[];
+  DateTime _lastSave = DateTime.now();
 
   Profile? _profile;
   Catalog? _catalog;
@@ -46,16 +54,64 @@ class _HomeScreenState extends State<HomeScreen>
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _subs.add(_player.stream.buffering.listen((b) {
+      _buffering.value = b;
+    }));
+    _subs.add(_player.stream.error.listen((e) {
+      if (e.isNotEmpty) _err.value = e;
+    }));
+    _subs.add(_player.stream.playing.listen((p) {
+      if (p) {
+        _err.value = null;
+        WakelockPlus.enable();
+      } else {
+        WakelockPlus.disable();
+      }
+    }));
+    _subs.add(_player.stream.position.listen((_) {
+      final now = DateTime.now();
+      if (now.difference(_lastSave).inSeconds >= 10) {
+        _lastSave = now;
+        _saveNow();
+      }
+    }));
     _init();
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _saveNow();
+    for (final s in _subs) {
+      s.cancel();
+    }
+    WakelockPlus.disable();
     _player.dispose();
     _tabs.dispose();
     _search.dispose();
     _title.dispose();
+    _buffering.dispose();
+    _err.dispose();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.inactive) {
+      _saveNow();
+    }
+  }
+
+  Future<void> _saveNow() async {
+    final c = _current;
+    if (c == null || c.kind == Kind.live || c.url.isEmpty) return;
+    await ProgressStore.save(
+      c.url,
+      _player.state.position,
+      _player.state.duration,
+    );
   }
 
   Future<void> _init() async {
@@ -76,11 +132,7 @@ class _HomeScreenState extends State<HomeScreen>
 
   String _friendly(Object e) {
     final t = e.toString();
-    final short = t.length > 140 ? '${t.substring(0, 140)}...' : t;
-    if (t.contains('DioException')) {
-      return 'Não foi possível baixar a lista. Confira endereço, usuário e senha.\n\n$short';
-    }
-    return short;
+    return t.length > 160 ? '${t.substring(0, 160)}...' : t;
   }
 
   List<String> _catsOf(List<Item> items) {
@@ -128,6 +180,7 @@ class _HomeScreenState extends State<HomeScreen>
       MaterialPageRoute(builder: (_) => const ProfilesScreen()),
     );
     if (p != null) {
+      await _saveNow();
       await _player.stop();
       if (!mounted) return;
       setState(() {
@@ -140,9 +193,25 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
   Future<void> _play(Item it) async {
+    await _saveNow();
+    _err.value = null;
+    if (!mounted) return;
     setState(() => _current = it);
     _title.value = it.name;
     await _player.open(Media(it.url, httpHeaders: _headers));
+    if (it.kind == Kind.live) return;
+
+    final saved = await ProgressStore.position(it.url);
+    if (saved == null) return;
+    for (var i = 0; i < 60; i++) {
+      if (!mounted || _current?.url != it.url) return;
+      if (_player.state.duration > Duration.zero) break;
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+    }
+    if (!mounted || _current?.url != it.url) return;
+    if (_player.state.duration > Duration.zero) {
+      await _player.seek(saved);
+    }
   }
 
   Future<void> _select(Item it, {bool full = false}) async {
@@ -187,12 +256,15 @@ class _HomeScreenState extends State<HomeScreen>
           controller: _controller,
           player: _player,
           title: _title,
+          buffering: _buffering,
+          error: _err,
           isLive: live,
           onNext: hasQueue ? _nextEp : null,
           onPrev: hasQueue ? _prevEp : null,
         ),
       ),
     );
+    await _saveNow();
     await SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
     await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     if (mounted) setState(() => _full = false);
@@ -394,12 +466,21 @@ class _HomeScreenState extends State<HomeScreen>
                   ],
                 ),
               )
-            : GestureDetector(
-                onDoubleTap: _enterFull,
-                child: Video(
-                  controller: _controller,
-                  controls: NoVideoControls,
-                ),
+            : Stack(
+                children: [
+                  Positioned.fill(
+                    child: GestureDetector(
+                      onDoubleTap: _enterFull,
+                      child: Video(
+                        controller: _controller,
+                        controls: NoVideoControls,
+                      ),
+                    ),
+                  ),
+                  Positioned.fill(
+                    child: _StatusOverlay(buffering: _buffering, error: _err),
+                  ),
+                ],
               ),
       ),
     );
@@ -512,10 +593,55 @@ class _HomeScreenState extends State<HomeScreen>
   }
 }
 
+class _StatusOverlay extends StatelessWidget {
+  final ValueNotifier<bool> buffering;
+  final ValueNotifier<String?> error;
+
+  const _StatusOverlay({required this.buffering, required this.error});
+
+  @override
+  Widget build(BuildContext context) {
+    return IgnorePointer(
+      child: ValueListenableBuilder<String?>(
+        valueListenable: error,
+        builder: (context, e, _) {
+          if (e != null) {
+            return Container(
+              color: Colors.black87,
+              alignment: Alignment.center,
+              padding: const EdgeInsets.all(16),
+              child: const Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.error_outline, color: Colors.white, size: 40),
+                  SizedBox(height: 8),
+                  Text(
+                    'Não foi possível reproduzir.\nTente outro item ou tente de novo mais tarde.',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(color: Colors.white),
+                  ),
+                ],
+              ),
+            );
+          }
+          return ValueListenableBuilder<bool>(
+            valueListenable: buffering,
+            builder: (context, b, _) => b
+                ? const Center(child: CircularProgressIndicator())
+                : const SizedBox.shrink(),
+          );
+        },
+      ),
+    );
+  }
+}
+
 class _FullScreen extends StatefulWidget {
   final VideoController controller;
   final Player player;
   final ValueNotifier<String> title;
+  final ValueNotifier<bool> buffering;
+  final ValueNotifier<String?> error;
   final bool isLive;
   final Future<void> Function()? onNext;
   final Future<void> Function()? onPrev;
@@ -524,6 +650,8 @@ class _FullScreen extends StatefulWidget {
     required this.controller,
     required this.player,
     required this.title,
+    required this.buffering,
+    required this.error,
     required this.isLive,
     this.onNext,
     this.onPrev,
@@ -688,6 +816,12 @@ class _FullScreenState extends State<_FullScreen> {
                 controls: NoVideoControls,
                 fit: _fill ? BoxFit.cover : BoxFit.contain,
               ),
+            ),
+          ),
+          Positioned.fill(
+            child: _StatusOverlay(
+              buffering: widget.buffering,
+              error: widget.error,
             ),
           ),
           if (_bar)

@@ -1,15 +1,11 @@
-import 'dart:async';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
-import 'package:media_kit/media_kit.dart';
-import 'package:media_kit_video/media_kit_video.dart';
-import 'package:wakelock_plus/wakelock_plus.dart';
+
+import '../../data/profiles/favorites_store.dart';
 import '../../data/profiles/iptv_api.dart';
 import '../../data/profiles/profile.dart';
-import '../../data/profiles/progress_store.dart';
+import '../theme.dart';
+import 'dashboard_screen.dart';
 import 'profiles_screen.dart';
-
-const _headers = {'User-Agent': 'VLC/3.0.18 LibVLC/3.0.18'};
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -18,860 +14,147 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen>
-    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
-  late final Player _player = Player();
-  late final VideoController _controller = VideoController(_player);
-  late final TabController _tabs = TabController(length: 3, vsync: this);
-  final TextEditingController _search = TextEditingController();
-  final ValueNotifier<String> _title = ValueNotifier<String>('');
-  final ValueNotifier<bool> _buffering = ValueNotifier<bool>(false);
-  final ValueNotifier<String?> _err = ValueNotifier<String?>(null);
-  final List<StreamSubscription<dynamic>> _subs =
-      <StreamSubscription<dynamic>>[];
-  DateTime _lastSave = DateTime.now();
-
+class _HomeScreenState extends State<HomeScreen> {
   Profile? _profile;
-  Catalog? _catalog;
   bool _loading = true;
   String? _error;
-  bool _full = false;
-  Item? _current;
-  List<Item> _queue = <Item>[];
-  int _qi = -1;
-
-  final Map<Kind, String?> _cat = {
-    Kind.live: null,
-    Kind.movie: null,
-    Kind.series: null,
-  };
-  final Map<Kind, List<String>> _cats = {
-    Kind.live: <String>[],
-    Kind.movie: <String>[],
-    Kind.series: <String>[],
-  };
 
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addObserver(this);
-    _subs.add(_player.stream.buffering.listen((b) {
-      _buffering.value = b;
-    }));
-    _subs.add(_player.stream.error.listen((e) {
-      if (e.isNotEmpty) _err.value = e;
-    }));
-    _subs.add(_player.stream.playing.listen((p) {
-      if (p) {
-        _err.value = null;
-        WakelockPlus.enable();
-      } else {
-        WakelockPlus.disable();
-      }
-    }));
-    _subs.add(_player.stream.position.listen((_) {
-      final now = DateTime.now();
-      if (now.difference(_lastSave).inSeconds >= 10) {
-        _lastSave = now;
-        _saveNow();
-      }
-    }));
-    _init();
+    _start();
   }
 
-  @override
-  void dispose() {
-    WidgetsBinding.instance.removeObserver(this);
-    _saveNow();
-    for (final s in _subs) {
-      s.cancel();
-    }
-    WakelockPlus.disable();
-    _player.dispose();
-    _tabs.dispose();
-    _search.dispose();
-    _title.dispose();
-    _buffering.dispose();
-    _err.dispose();
-    super.dispose();
-  }
-
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.paused ||
-        state == AppLifecycleState.inactive) {
-      _saveNow();
-    }
-  }
-
-  Future<void> _saveNow() async {
-    final c = _current;
-    if (c == null || c.kind == Kind.live || c.url.isEmpty) return;
-    await ProgressStore.save(
-      c.url,
-      _player.state.position,
-      _player.state.duration,
-    );
-  }
-
-  Future<void> _init() async {
-    final list = await ProfileStore.load();
-    final id = await ProfileStore.activeId();
-    Profile? active;
-    for (final p in list) {
-      if (p.id == id) active = p;
-    }
-    if (active == null) {
-      if (!mounted) return;
-      setState(() => _loading = false);
-      WidgetsBinding.instance.addPostFrameCallback((_) => _openProfiles());
-      return;
-    }
-    await _loadProfile(active);
-  }
-
-  String _friendly(Object e) {
-    final t = e.toString();
-    return t.length > 160 ? '${t.substring(0, 160)}...' : t;
-  }
-
-  List<String> _catsOf(List<Item> items) {
-    final s = <String>{};
-    for (final i in items) {
-      s.add(i.category);
-    }
-    final l = s.toList();
-    l.sort();
-    return l;
-  }
-
-  Future<void> _loadProfile(Profile p) async {
-    setState(() {
-      _profile = p;
-      _loading = true;
-      _error = null;
-      _catalog = null;
-      _cat[Kind.live] = null;
-      _cat[Kind.movie] = null;
-      _cat[Kind.series] = null;
-    });
+  Future<void> _start() async {
     try {
-      final c = await IptvApi.load(p);
+      final profiles = await ProfileStore.load();
+      final id = await ProfileStore.activeId();
+      Profile? found;
+      for (final p in profiles) {
+        if (p.id == id) found = p;
+      }
       if (!mounted) return;
-      _cats[Kind.live] = _catsOf(c.live);
-      _cats[Kind.movie] = _catsOf(c.movies);
-      _cats[Kind.series] = _catsOf(c.series);
-      setState(() {
-        _catalog = c;
-        _loading = false;
-      });
+      if (found == null) {
+        setState(() => _loading = false);
+        await _choose();
+      } else {
+        _profile = found;
+        await _open(found);
+      }
     } catch (e) {
       if (!mounted) return;
       setState(() {
-        _error = _friendly(e);
         _loading = false;
+        _error = e.toString();
       });
     }
   }
 
-  Future<void> _openProfiles() async {
-    if (!mounted) return;
+  Future<void> _choose() async {
     final p = await Navigator.of(context).push<Profile>(
       MaterialPageRoute(builder: (_) => const ProfilesScreen()),
     );
-    if (p != null) {
-      await _saveNow();
-      await _player.stop();
+    if (p == null || !mounted) return;
+    await ProfileStore.setActive(p.id);
+    _profile = p;
+    await _open(p);
+  }
+
+  Future<void> _open(Profile p) async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      final catalog = await IptvApi.load(p);
+      await FavoritesStore.preload(p.id);
+      if (!mounted) return;
+      setState(() => _loading = false);
+      await Navigator.of(context).push(
+        MaterialPageRoute(
+          builder: (_) => DashboardScreen(
+            profile: p,
+            catalog: catalog,
+          ),
+        ),
+      );
+    } catch (e) {
       if (!mounted) return;
       setState(() {
-        _current = null;
-        _queue = <Item>[];
-        _qi = -1;
+        _loading = false;
+        _error = e.toString();
       });
-      await _loadProfile(p);
     }
-  }
-
-  Future<void> _play(Item it) async {
-    await _saveNow();
-    _err.value = null;
-    if (!mounted) return;
-    setState(() => _current = it);
-    _title.value = it.name;
-    await _player.open(Media(it.url, httpHeaders: _headers));
-    if (it.kind == Kind.live) return;
-
-    final saved = await ProgressStore.position(it.url);
-    if (saved == null) return;
-    for (var i = 0; i < 60; i++) {
-      if (!mounted || _current?.url != it.url) return;
-      if (_player.state.duration > Duration.zero) break;
-      await Future<void>.delayed(const Duration(milliseconds: 300));
-    }
-    if (!mounted || _current?.url != it.url) return;
-    if (_player.state.duration > Duration.zero) {
-      await _player.seek(saved);
-    }
-  }
-
-  Future<void> _select(Item it, {bool full = false}) async {
-    if (it.url.isEmpty) {
-      _openSeries(it);
-      return;
-    }
-    _queue = <Item>[];
-    _qi = -1;
-    await _play(it);
-    if (full) await _enterFull();
-  }
-
-  Future<void> _nextEp() async {
-    if (_qi >= 0 && _qi < _queue.length - 1) {
-      _qi++;
-      await _play(_queue[_qi]);
-    }
-  }
-
-  Future<void> _prevEp() async {
-    if (_qi > 0) {
-      _qi--;
-      await _play(_queue[_qi]);
-    }
-  }
-
-  Future<void> _enterFull() async {
-    if (_full || !mounted) return;
-    setState(() => _full = true);
-    await SystemChrome.setPreferredOrientations([
-      DeviceOrientation.landscapeLeft,
-      DeviceOrientation.landscapeRight,
-    ]);
-    await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
-    if (!mounted) return;
-    final live = _current?.kind == Kind.live;
-    final hasQueue = _queue.isNotEmpty;
-    await Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (_) => _FullScreen(
-          controller: _controller,
-          player: _player,
-          title: _title,
-          buffering: _buffering,
-          error: _err,
-          isLive: live,
-          onNext: hasQueue ? _nextEp : null,
-          onPrev: hasQueue ? _prevEp : null,
-        ),
-      ),
-    );
-    await _saveNow();
-    await SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
-    await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
-    if (mounted) setState(() => _full = false);
-  }
-
-  void _openSeries(Item serie) {
-    final p = _profile;
-    if (p == null) return;
-    showModalBottomSheet<void>(
-      context: context,
-      isScrollControlled: true,
-      builder: (ctx) {
-        return SizedBox(
-          height: MediaQuery.of(ctx).size.height * 0.7,
-          child: Column(
-            children: [
-              Padding(
-                padding: const EdgeInsets.all(16),
-                child: Text(
-                  serie.name,
-                  style: Theme.of(ctx).textTheme.titleMedium,
-                  maxLines: 2,
-                  overflow: TextOverflow.ellipsis,
-                ),
-              ),
-              Expanded(
-                child: FutureBuilder<List<Item>>(
-                  future: IptvApi.episodes(p, serie),
-                  builder: (c, snap) {
-                    if (snap.connectionState != ConnectionState.done) {
-                      return const Center(child: CircularProgressIndicator());
-                    }
-                    if (snap.hasError) {
-                      return const Center(
-                        child: Text('Não foi possível carregar os episódios.'),
-                      );
-                    }
-                    final eps = snap.data ?? <Item>[];
-                    if (eps.isEmpty) {
-                      return const Center(child: Text('Sem episódios.'));
-                    }
-                    return ListView.builder(
-                      itemCount: eps.length,
-                      itemBuilder: (c2, i) {
-                        final ep = eps[i];
-                        return ListTile(
-                          leading: const Icon(Icons.play_circle_outline),
-                          title: Text(ep.name),
-                          onTap: () async {
-                            Navigator.of(ctx).pop();
-                            _queue = eps;
-                            _qi = i;
-                            await _play(ep);
-                            await _enterFull();
-                          },
-                        );
-                      },
-                    );
-                  },
-                ),
-              ),
-            ],
-          ),
-        );
-      },
-    );
-  }
-
-  List<Item> _itemsOf(Kind k) {
-    final c = _catalog;
-    if (c == null) return <Item>[];
-    return switch (k) {
-      Kind.live => c.live,
-      Kind.movie => c.movies,
-      Kind.series => c.series,
-    };
-  }
-
-  Widget _thumb(Item it) {
-    final fallback = Container(
-      width: 48,
-      height: 48,
-      color: Colors.white10,
-      child: Icon(it.kind == Kind.live ? Icons.live_tv : Icons.movie, size: 22),
-    );
-    final logo = it.logo;
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(8),
-      child: logo == null
-          ? fallback
-          : Image.network(
-              logo,
-              width: 48,
-              height: 48,
-              fit: BoxFit.cover,
-              cacheWidth: 120,
-              errorBuilder: (_, __, ___) => fallback,
-            ),
-    );
-  }
-
-  Widget _tabBody(Kind k) {
-    final all = _itemsOf(k);
-    final cats = _cats[k] ?? <String>[];
-    final sel = _cat[k];
-    final q = _search.text.trim().toLowerCase();
-    final shown = all.where((i) {
-      final okCat = sel == null || i.category == sel;
-      final okQ = q.isEmpty || i.name.toLowerCase().contains(q);
-      return okCat && okQ;
-    }).toList();
-
-    return Column(
-      children: [
-        SizedBox(
-          height: 46,
-          child: ListView(
-            scrollDirection: Axis.horizontal,
-            padding: const EdgeInsets.symmetric(horizontal: 12),
-            children: [
-              Padding(
-                padding: const EdgeInsets.only(right: 8),
-                child: ChoiceChip(
-                  label: const Text('Todos'),
-                  selected: sel == null,
-                  onSelected: (_) => setState(() => _cat[k] = null),
-                ),
-              ),
-              for (final c in cats)
-                Padding(
-                  padding: const EdgeInsets.only(right: 8),
-                  child: ChoiceChip(
-                    label: Text(c),
-                    selected: sel == c,
-                    onSelected: (_) => setState(() => _cat[k] = c),
-                  ),
-                ),
-            ],
-          ),
-        ),
-        Expanded(
-          child: shown.isEmpty
-              ? const Center(child: Text('Nada encontrado.'))
-              : ListView.builder(
-                  itemCount: shown.length,
-                  itemBuilder: (context, index) {
-                    final it = shown[index];
-                    final playing = _current != null &&
-                        _current!.id == it.id &&
-                        _current!.kind == it.kind;
-                    return InkWell(
-                      onTap: () => _select(it),
-                      onDoubleTap: () => _select(it, full: true),
-                      child: Container(
-                        color: playing ? Colors.white10 : null,
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 16, vertical: 8),
-                        child: Row(
-                          children: [
-                            _thumb(it),
-                            const SizedBox(width: 12),
-                            Expanded(
-                              child: Text(
-                                it.name,
-                                maxLines: 2,
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                            ),
-                            if (playing) const Icon(Icons.equalizer, size: 20),
-                            if (it.url.isEmpty) const Icon(Icons.chevron_right),
-                          ],
-                        ),
-                      ),
-                    );
-                  },
-                ),
-        ),
-      ],
-    );
-  }
-
-  Widget _videoArea() {
-    final cur = _current;
-    return AspectRatio(
-      aspectRatio: 16 / 9,
-      child: Container(
-        color: Colors.black,
-        child: (cur == null || _full)
-            ? Center(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    const Icon(Icons.live_tv, size: 48),
-                    const SizedBox(height: 8),
-                    Text(
-                      cur == null ? 'SELECIONE UM CANAL' : cur.name,
-                      textAlign: TextAlign.center,
-                    ),
-                  ],
-                ),
-              )
-            : Stack(
-                children: [
-                  Positioned.fill(
-                    child: GestureDetector(
-                      onDoubleTap: _enterFull,
-                      child: Video(
-                        controller: _controller,
-                        controls: NoVideoControls,
-                      ),
-                    ),
-                  ),
-                  Positioned.fill(
-                    child: _StatusOverlay(buffering: _buffering, error: _err),
-                  ),
-                ],
-              ),
-      ),
-    );
-  }
-
-  Widget _body() {
-    if (_loading) {
-      return const Center(child: CircularProgressIndicator());
-    }
-    if (_error != null) {
-      return Center(
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Text(_error!, textAlign: TextAlign.center),
-              const SizedBox(height: 16),
-              FilledButton(
-                onPressed: () {
-                  final p = _profile;
-                  if (p != null) _loadProfile(p);
-                },
-                child: const Text('Tentar de novo'),
-              ),
-              TextButton(
-                onPressed: _openProfiles,
-                child: const Text('Trocar lista'),
-              ),
-            ],
-          ),
-        ),
-      );
-    }
-    final c = _catalog;
-    if (c == null) {
-      return Center(
-        child: FilledButton.icon(
-          onPressed: _openProfiles,
-          icon: const Icon(Icons.playlist_add),
-          label: const Text('Escolher ou adicionar lista'),
-        ),
-      );
-    }
-    return Column(
-      children: [
-        TabBar(
-          controller: _tabs,
-          tabs: [
-            Tab(text: 'Ao vivo (${c.live.length})'),
-            Tab(text: 'Filmes (${c.movies.length})'),
-            Tab(text: 'Séries (${c.series.length})'),
-          ],
-        ),
-        Padding(
-          padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
-          child: TextField(
-            controller: _search,
-            onChanged: (_) => setState(() {}),
-            decoration: const InputDecoration(
-              prefixIcon: Icon(Icons.search),
-              hintText: 'Buscar',
-              isDense: true,
-              border: OutlineInputBorder(),
-            ),
-          ),
-        ),
-        Expanded(
-          child: TabBarView(
-            controller: _tabs,
-            children: [
-              _tabBody(Kind.live),
-              _tabBody(Kind.movie),
-              _tabBody(Kind.series),
-            ],
-          ),
-        ),
-      ],
-    );
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: Text(_profile?.name ?? 'AG PLAYER'),
-        actions: [
-          IconButton(
-            tooltip: 'Listas',
-            icon: const Icon(Icons.playlist_play),
-            onPressed: _openProfiles,
-          ),
-          IconButton(
-            tooltip: 'Atualizar',
-            icon: const Icon(Icons.refresh),
-            onPressed: () {
-              final p = _profile;
-              if (p != null) _loadProfile(p);
-            },
-          ),
-        ],
-      ),
-      body: Column(
-        children: [
-          _videoArea(),
-          Expanded(child: _body()),
-        ],
-      ),
-    );
-  }
-}
-
-class _StatusOverlay extends StatelessWidget {
-  final ValueNotifier<bool> buffering;
-  final ValueNotifier<String?> error;
-
-  const _StatusOverlay({required this.buffering, required this.error});
-
-  @override
-  Widget build(BuildContext context) {
-    return IgnorePointer(
-      child: ValueListenableBuilder<String?>(
-        valueListenable: error,
-        builder: (context, e, _) {
-          if (e != null) {
-            return Container(
-              color: Colors.black87,
-              alignment: Alignment.center,
-              padding: const EdgeInsets.all(16),
-              child: const Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(Icons.error_outline, color: Colors.white, size: 40),
-                  SizedBox(height: 8),
-                  Text(
-                    'Não foi possível reproduzir.\nTente outro item ou tente de novo mais tarde.',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(color: Colors.white),
-                  ),
-                ],
-              ),
-            );
-          }
-          return ValueListenableBuilder<bool>(
-            valueListenable: buffering,
-            builder: (context, b, _) => b
-                ? const Center(child: CircularProgressIndicator())
-                : const SizedBox.shrink(),
-          );
-        },
-      ),
-    );
-  }
-}
-
-class _FullScreen extends StatefulWidget {
-  final VideoController controller;
-  final Player player;
-  final ValueNotifier<String> title;
-  final ValueNotifier<bool> buffering;
-  final ValueNotifier<String?> error;
-  final bool isLive;
-  final Future<void> Function()? onNext;
-  final Future<void> Function()? onPrev;
-
-  const _FullScreen({
-    required this.controller,
-    required this.player,
-    required this.title,
-    required this.buffering,
-    required this.error,
-    required this.isLive,
-    this.onNext,
-    this.onPrev,
-  });
-
-  @override
-  State<_FullScreen> createState() => _FullScreenState();
-}
-
-class _FullScreenState extends State<_FullScreen> {
-  bool _fill = true;
-  bool _bar = true;
-  double? _drag;
-
-  String _fmt(Duration d) {
-    String two(int n) => n.toString().padLeft(2, '0');
-    final h = d.inHours;
-    final m = d.inMinutes.remainder(60);
-    final s = d.inSeconds.remainder(60);
-    return h > 0 ? '$h:${two(m)}:${two(s)}' : '${two(m)}:${two(s)}';
-  }
-
-  Future<void> _seekBy(Duration delta) async {
-    final pos = widget.player.state.position;
-    final total = widget.player.state.duration;
-    var t = pos + delta;
-    if (t < Duration.zero) t = Duration.zero;
-    if (total > Duration.zero && t > total) t = total;
-    await widget.player.seek(t);
-  }
-
-  Future<void> _chapter(int n) async {
-    try {
-      await (widget.player.platform as dynamic).command(['add', 'chapter', '$n']);
-    } catch (_) {}
-  }
-
-  Widget _btn(IconData icon, String label, VoidCallback? onTap) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 2),
-      child: TextButton.icon(
-        style: TextButton.styleFrom(foregroundColor: Colors.white),
-        onPressed: onTap,
-        icon: Icon(icon, size: 20),
-        label: Text(label),
-      ),
-    );
-  }
-
-  Widget _seekBar() {
-    return StreamBuilder<Duration>(
-      stream: widget.player.stream.duration,
-      initialData: widget.player.state.duration,
-      builder: (context, dsnap) {
-        final total = dsnap.data ?? Duration.zero;
-        return StreamBuilder<Duration>(
-          stream: widget.player.stream.position,
-          initialData: widget.player.state.position,
-          builder: (context, psnap) {
-            final pos = psnap.data ?? Duration.zero;
-            final maxMs = total.inMilliseconds <= 0
-                ? 1.0
-                : total.inMilliseconds.toDouble();
-            final cur = (_drag ?? pos.inMilliseconds.toDouble())
-                .clamp(0.0, maxMs)
-                .toDouble();
-            return Row(
+      backgroundColor: agBlack,
+      body: SafeArea(
+        child: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
               children: [
-                Text(
-                  _fmt(Duration(milliseconds: cur.toInt())),
-                  style: const TextStyle(color: Colors.white),
-                ),
-                Expanded(
-                  child: Slider(
-                    min: 0,
-                    max: maxMs,
-                    value: cur,
-                    onChanged: (v) => setState(() => _drag = v),
-                    onChangeEnd: (v) async {
-                      await widget.player
-                          .seek(Duration(milliseconds: v.toInt()));
-                      if (mounted) setState(() => _drag = null);
-                    },
+                const Text(
+                  'AG PLAYER',
+                  style: TextStyle(
+                    color: agGold,
+                    fontSize: 34,
+                    fontWeight: FontWeight.bold,
+                    letterSpacing: 4,
                   ),
                 ),
-                Text(
-                  _fmt(total),
-                  style: const TextStyle(color: Colors.white),
-                ),
-              ],
-            );
-          },
-        );
-      },
-    );
-  }
-
-  Widget _playButton() {
-    return StreamBuilder<bool>(
-      stream: widget.player.stream.playing,
-      initialData: widget.player.state.playing,
-      builder: (context, snap) {
-        final playing = snap.data ?? false;
-        return IconButton(
-          iconSize: 40,
-          color: Colors.white,
-          icon: Icon(playing ? Icons.pause_circle : Icons.play_circle),
-          onPressed: () => widget.player.playOrPause(),
-        );
-      },
-    );
-  }
-
-  Widget _bottom() {
-    if (widget.isLive) {
-      return Center(child: _playButton());
-    }
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        _seekBar(),
-        SingleChildScrollView(
-          scrollDirection: Axis.horizontal,
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              if (widget.onPrev != null)
-                _btn(Icons.skip_previous, 'Ep.', () => widget.onPrev!()),
-              _btn(Icons.fast_rewind, 'Cap.', () => _chapter(-1)),
-              _btn(Icons.replay, '-5 min',
-                  () => _seekBy(const Duration(minutes: -5))),
-              _btn(Icons.replay_10, '-10 s',
-                  () => _seekBy(const Duration(seconds: -10))),
-              _playButton(),
-              _btn(Icons.forward_10, '+10 s',
-                  () => _seekBy(const Duration(seconds: 10))),
-              _btn(Icons.update, '+5 min',
-                  () => _seekBy(const Duration(minutes: 5))),
-              _btn(Icons.fast_forward, 'Cap.', () => _chapter(1)),
-              if (widget.onNext != null)
-                _btn(Icons.skip_next, 'Ep.', () => widget.onNext!()),
-            ],
-          ),
-        ),
-      ],
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: Colors.black,
-      body: Stack(
-        children: [
-          Positioned.fill(
-            child: GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onTap: () => setState(() => _bar = !_bar),
-              onDoubleTap: () => Navigator.of(context).pop(),
-              child: Video(
-                controller: widget.controller,
-                controls: NoVideoControls,
-                fit: _fill ? BoxFit.cover : BoxFit.contain,
-              ),
-            ),
-          ),
-          Positioned.fill(
-            child: _StatusOverlay(
-              buffering: widget.buffering,
-              error: widget.error,
-            ),
-          ),
-          if (_bar)
-            Positioned(
-              top: 0,
-              left: 0,
-              right: 0,
-              child: Container(
-                color: Colors.black54,
-                padding: const EdgeInsets.fromLTRB(8, 8, 8, 4),
-                child: Row(
-                  children: [
-                    IconButton(
-                      color: Colors.white,
-                      icon: const Icon(Icons.arrow_back),
-                      onPressed: () => Navigator.of(context).pop(),
+                const SizedBox(height: 32),
+                if (_loading) ...[
+                  const CircularProgressIndicator(color: agGold),
+                  const SizedBox(height: 16),
+                  const Text(
+                    'Carregando sua lista...',
+                    style: TextStyle(color: Colors.white70),
+                  ),
+                ] else ...[
+                  if (_error != null) ...[
+                    Text(
+                      _error!,
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(color: Colors.redAccent),
                     ),
-                    Expanded(
-                      child: ValueListenableBuilder<String>(
-                        valueListenable: widget.title,
-                        builder: (context, t, _) => Text(
-                          t,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(color: Colors.white),
+                    const SizedBox(height: 20),
+                  ],
+                  if (_profile != null)
+                    SizedBox(
+                      width: double.infinity,
+                      child: ElevatedButton(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: agGold,
+                          foregroundColor: Colors.black,
+                          padding: const EdgeInsets.symmetric(vertical: 14),
                         ),
+                        onPressed: () => _open(_profile!),
+                        child: Text('Entrar em ${_profile!.name}'),
                       ),
                     ),
-                    TextButton(
-                      style: TextButton.styleFrom(
-                          foregroundColor: Colors.white),
-                      onPressed: () => setState(() => _fill = !_fill),
-                      child: Text(_fill ? 'Preencher' : 'Original'),
+                  const SizedBox(height: 12),
+                  SizedBox(
+                    width: double.infinity,
+                    child: OutlinedButton(
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: agGold,
+                        side: const BorderSide(color: agGold),
+                        padding: const EdgeInsets.symmetric(vertical: 14),
+                      ),
+                      onPressed: _choose,
+                      child: const Text('Perfis / adicionar lista'),
                     ),
-                  ],
-                ),
-              ),
+                  ),
+                ],
+              ],
             ),
-          if (_bar)
-            Positioned(
-              bottom: 0,
-              left: 0,
-              right: 0,
-              child: Container(
-                color: Colors.black54,
-                padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
-                child: _bottom(),
-              ),
-            ),
-        ],
+          ),
+        ),
       ),
     );
   }

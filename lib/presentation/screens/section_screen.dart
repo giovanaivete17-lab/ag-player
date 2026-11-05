@@ -6,6 +6,7 @@ import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
+import '../../data/profiles/epg_api.dart';
 import '../../data/profiles/favorites_store.dart';
 import '../../data/profiles/iptv_api.dart';
 import '../../data/profiles/profile.dart';
@@ -17,7 +18,8 @@ class _Media {
   final String name;
   final String url;
   final bool live;
-  const _Media(this.name, this.url, this.live);
+  final String? sid;
+  const _Media(this.name, this.url, this.live, {this.sid});
 }
 
 class SectionScreen extends StatefulWidget {
@@ -54,6 +56,8 @@ class _SectionScreenState extends State<SectionScreen>
   _Media? _current;
   List<_Media> _queue = [];
   List<Item> _favs = [];
+  List<EpgEntry> _epg = [];
+  bool _epgLoading = false;
   List<String> _cands = [];
   int _ci = 0;
   int _qIndex = -1;
@@ -64,9 +68,11 @@ class _SectionScreenState extends State<SectionScreen>
   bool _dragging = false;
   double _dragValue = 0;
   String? _error;
+  String _lastErr = '';
   DateTime _lastSave = DateTime.fromMillisecondsSinceEpoch(0);
   Timer? _hideTimer;
   Timer? _openTimer;
+  Timer? _epgTimer;
 
   @override
   void initState() {
@@ -100,6 +106,9 @@ class _SectionScreenState extends State<SectionScreen>
         _saveNow();
       }
     }));
+    _subs.add(_player.stream.width.listen((w) {
+      if ((w ?? 0) > 0) _openTimer?.cancel();
+    }));
     _subs.add(_player.stream.duration.listen((d) => _durN.value = d));
     _subs.add(_player.stream.playing.listen((v) {
       if (mounted) setState(() => _playing = v);
@@ -108,8 +117,11 @@ class _SectionScreenState extends State<SectionScreen>
       if (mounted) setState(() => _buffering = v);
     }));
     _subs.add(_player.stream.error.listen((e) {
-      if (!mounted || e.toString().isEmpty) return;
+      final msg = e.toString();
+      if (!mounted || msg.isEmpty) return;
+      _lastErr = msg;
       if (_posN.value > const Duration(seconds: 3)) return;
+      if ((_player.state.width ?? 0) > 0) return;
       _failOver();
     }));
     _subs.add(_player.stream.completed.listen((c) {
@@ -117,12 +129,24 @@ class _SectionScreenState extends State<SectionScreen>
         _step(1);
       }
     }));
+
+    _epgTimer = Timer.periodic(const Duration(seconds: 60), (_) {
+      final m = _current;
+      if (!mounted || m == null || !m.live || _full) return;
+      final now = DateTime.now();
+      if (!_epgLoading && !_epg.any((e) => e.stop.isAfter(now))) {
+        _loadEpg(m);
+      } else {
+        setState(() {});
+      }
+    });
   }
 
   @override
   void dispose() {
     _hideTimer?.cancel();
     _openTimer?.cancel();
+    _epgTimer?.cancel();
     FavoritesStore.changes.removeListener(_loadFavs);
     for (final s in _subs) {
       s.cancel();
@@ -191,22 +215,180 @@ class _SectionScreenState extends State<SectionScreen>
     return null;
   }
 
+  // ---------- programação (EPG) ----------
+
+  Future<void> _loadEpg(_Media m) async {
+    final sid = m.sid;
+    if (!m.live || sid == null || !EpgApi.canLoad(widget.profile)) {
+      if (mounted) {
+        setState(() {
+          _epg = [];
+          _epgLoading = false;
+        });
+      }
+      return;
+    }
+    if (mounted) {
+      setState(() {
+        _epg = [];
+        _epgLoading = true;
+      });
+    }
+    final l = await EpgApi.load(widget.profile, sid);
+    if (!mounted || !identical(_current, m)) return;
+    setState(() {
+      _epg = l;
+      _epgLoading = false;
+    });
+  }
+
+  String _hm(DateTime d) =>
+      '${d.hour.toString().padLeft(2, '0')}:${d.minute.toString().padLeft(2, '0')}';
+
+  Widget _epgNote(String t) => Container(
+        width: double.infinity,
+        color: agBlack,
+        padding: const EdgeInsets.all(14),
+        child: Text(t, style: const TextStyle(color: Colors.white54)),
+      );
+
+  Widget _epgPanel() {
+    final cur = _current;
+    if (cur == null || !cur.live) return const SizedBox.shrink();
+    if (!EpgApi.canLoad(widget.profile)) {
+      return _epgNote('Programação só em listas com usuário e senha.');
+    }
+    if (_epgLoading) return _epgNote('Carregando programação...');
+    final now = DateTime.now();
+    final up = _epg.where((e) => e.stop.isAfter(now)).toList();
+    if (up.isEmpty) {
+      return _epgNote('Programação indisponível para este canal.');
+    }
+    EpgEntry? nowE;
+    if (!up.first.start.isAfter(now)) nowE = up.first;
+    final next = nowE == null ? up : up.skip(1).toList();
+
+    double prog = 0;
+    if (nowE != null) {
+      final total = nowE.stop.difference(nowE.start).inSeconds;
+      final done = now.difference(nowE.start).inSeconds;
+      prog = (done / (total < 1 ? 1 : total)).clamp(0.0, 1.0).toDouble();
+    }
+
+    return Container(
+      width: double.infinity,
+      color: agBlack,
+      padding: const EdgeInsets.all(14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (nowE != null) ...[
+            const Text('AGORA',
+                style: TextStyle(
+                    color: agGold,
+                    fontSize: 11,
+                    fontWeight: FontWeight.bold)),
+            const SizedBox(height: 4),
+            Text(nowE.title,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 15,
+                    fontWeight: FontWeight.bold)),
+            const SizedBox(height: 2),
+            Text('${_hm(nowE.start)} – ${_hm(nowE.stop)}',
+                style: const TextStyle(color: Colors.white54, fontSize: 12)),
+            const SizedBox(height: 6),
+            LinearProgressIndicator(
+              value: prog,
+              minHeight: 3,
+              color: agGold,
+              backgroundColor: agPanelLine,
+            ),
+            if (nowE.description.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: Text(nowE.description,
+                    maxLines: 3,
+                    overflow: TextOverflow.ellipsis,
+                    style:
+                        const TextStyle(color: Colors.white70, fontSize: 12)),
+              ),
+          ],
+          if (next.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            const Text('A SEGUIR',
+                style: TextStyle(
+                    color: agGold,
+                    fontSize: 11,
+                    fontWeight: FontWeight.bold)),
+            const SizedBox(height: 4),
+            for (final e in next.take(3))
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 3),
+                child: Row(
+                  children: [
+                    SizedBox(
+                      width: 52,
+                      child: Text(_hm(e.start),
+                          style: const TextStyle(
+                              color: Colors.white54, fontSize: 12)),
+                    ),
+                    Expanded(
+                      child: Text(e.title,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                              color: Colors.white70, fontSize: 13)),
+                    ),
+                  ],
+                ),
+              ),
+          ],
+        ],
+      ),
+    );
+  }
+
   // ---------- player ----------
 
-  _Media _media(Item it) =>
-      _Media(it.name, it.url, it.kind == Kind.live);
+  _Media _media(Item it) {
+    final live = it.kind == Kind.live;
+    return _Media(
+      it.name,
+      it.url,
+      live,
+      sid: live ? (EpgApi.streamIdFromUrl(it.url) ?? it.id.toString()) : null,
+    );
+  }
 
   List<String> _candidatesFor(_Media m) {
     final u = m.url;
     final out = <String>[u];
-    if (m.live) {
-      if (u.endsWith('.ts')) {
-        out.add('${u.substring(0, u.length - 3)}.m3u8');
-      } else if (u.endsWith('.m3u8')) {
-        out.add('${u.substring(0, u.length - 5)}.ts');
-      }
+    if (!m.live) return out;
+    String? stem;
+    if (u.endsWith('.ts')) {
+      stem = u.substring(0, u.length - 3);
+      out.add('$stem.m3u8');
+    } else if (u.endsWith('.m3u8')) {
+      stem = u.substring(0, u.length - 5);
+      out.add('$stem.ts');
     }
+    if (stem != null) out.add(stem);
     return out;
+  }
+
+  String _mask(String s) {
+    var r = s.replaceAllMapped(
+      RegExp(r'/(live|movie|series)/[^/\s]+/[^/\s]+/'),
+      (m) => '/${m[1]}/***/***/',
+    );
+    r = r.replaceAllMapped(
+      RegExp(r'(username|password)=[^&\s]+'),
+      (m) => '${m[1]}=***',
+    );
+    return r;
   }
 
   Future<void> _openUrl(String u) async {
@@ -214,7 +396,11 @@ class _SectionScreenState extends State<SectionScreen>
       await _player.open(Media(u), play: true);
       _openTimer?.cancel();
       _openTimer = Timer(const Duration(seconds: 25), () {
-        if (mounted && _posN.value == Duration.zero) _failOver();
+        if (mounted &&
+            _posN.value == Duration.zero &&
+            (_player.state.width ?? 0) == 0) {
+          _failOver();
+        }
       });
     } catch (_) {
       _failOver();
@@ -229,11 +415,14 @@ class _SectionScreenState extends State<SectionScreen>
       return;
     }
     if (!mounted) return;
+    var why = _mask(_lastErr);
+    if (why.length > 110) why = why.substring(0, 110);
     setState(() {
       _buffering = false;
-      _error = (_current?.live ?? false)
-          ? 'Canal indisponível no momento.'
-          : 'Não foi possível tocar este item.';
+      _error = ((_current?.live ?? false)
+              ? 'Canal indisponível no momento.'
+              : 'Não foi possível tocar este item.') +
+          (why.isEmpty ? '' : '\n($why)');
     });
   }
 
@@ -244,6 +433,7 @@ class _SectionScreenState extends State<SectionScreen>
     setState(() {
       _current = m;
       _error = null;
+      _lastErr = '';
       _buffering = true;
       _queue = queue ?? [];
       _qIndex = index;
@@ -252,6 +442,7 @@ class _SectionScreenState extends State<SectionScreen>
     _durN.value = Duration.zero;
     _cands = _candidatesFor(m);
     _ci = 0;
+    _loadEpg(m);
     await _cfg;
     await _openUrl(_cands[0]);
     if (!m.live) {
@@ -798,7 +989,8 @@ class _SectionScreenState extends State<SectionScreen>
                   child: Text(
                     _error!,
                     textAlign: TextAlign.center,
-                    style: const TextStyle(color: Colors.redAccent),
+                    style: const TextStyle(
+                        color: Colors.redAccent, fontSize: 12),
                   ),
                 ),
               ),
@@ -818,12 +1010,24 @@ class _SectionScreenState extends State<SectionScreen>
     );
   }
 
-  Widget _playerArea() {
+  Widget _playerArea({required bool wide}) {
     final cur = _current;
+    final h = MediaQuery.of(context).size.height;
+    final video = wide
+        ? Container(
+            color: Colors.black,
+            child: Center(
+              child: ConstrainedBox(
+                constraints: BoxConstraints(maxHeight: h * 0.5),
+                child: AspectRatio(aspectRatio: 16 / 9, child: _videoBox()),
+              ),
+            ),
+          )
+        : AspectRatio(aspectRatio: 16 / 9, child: _videoBox());
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
-        AspectRatio(aspectRatio: 16 / 9, child: _videoBox()),
+        video,
         if (cur != null)
           Container(
             width: double.infinity,
@@ -841,53 +1045,107 @@ class _SectionScreenState extends State<SectionScreen>
           color: agPanel,
           child: _controlsPanel(),
         ),
+        if (wide) _epgPanel(),
       ],
     );
   }
 
-  Widget _listArea() {
+  Widget _searchBox() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(10, 8, 10, 0),
+      child: TextField(
+        controller: _search,
+        style: const TextStyle(color: Colors.white),
+        onChanged: (v) => setState(() => _query = v.trim().toLowerCase()),
+        decoration: InputDecoration(
+          isDense: true,
+          filled: true,
+          fillColor: agPanel,
+          hintText: 'Buscar',
+          hintStyle: const TextStyle(color: Colors.white38),
+          prefixIcon: const Icon(Icons.search, color: agGold),
+          border: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(8),
+            borderSide: BorderSide.none,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _listArea({required bool tabs}) {
     return Column(
       children: [
-        TabBar(
-          controller: _tabs,
-          labelColor: agGold,
-          unselectedLabelColor: Colors.white70,
-          indicatorColor: agGold,
-          tabs: const [
-            Tab(text: 'Ao vivo'),
-            Tab(text: 'Filmes'),
-            Tab(text: 'Séries'),
-            Tab(text: 'Favoritos'),
-          ],
-        ),
-        Padding(
-          padding: const EdgeInsets.fromLTRB(10, 8, 10, 0),
-          child: TextField(
-            controller: _search,
-            style: const TextStyle(color: Colors.white),
-            onChanged: (v) =>
-                setState(() => _query = v.trim().toLowerCase()),
-            decoration: InputDecoration(
-              isDense: true,
-              filled: true,
-              fillColor: agPanel,
-              hintText: 'Buscar',
-              hintStyle: const TextStyle(color: Colors.white38),
-              prefixIcon: const Icon(Icons.search, color: agGold),
-              border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(8),
-                borderSide: BorderSide.none,
-              ),
-            ),
-          ),
-        ),
-        Expanded(
-          child: TabBarView(
+        if (tabs)
+          TabBar(
             controller: _tabs,
-            children: [for (var i = 0; i < 4; i++) _pageBody(i)],
+            labelColor: agGold,
+            unselectedLabelColor: Colors.white70,
+            indicatorColor: agGold,
+            tabs: const [
+              Tab(text: 'Ao vivo'),
+              Tab(text: 'Filmes'),
+              Tab(text: 'Séries'),
+              Tab(text: 'Favoritos'),
+            ],
           ),
+        _searchBox(),
+        Expanded(
+          child: tabs
+              ? TabBarView(
+                  controller: _tabs,
+                  children: [for (var i = 0; i < 4; i++) _pageBody(i)],
+                )
+              : _pageBody(_tabs.index),
         ),
       ],
+    );
+  }
+
+  Widget _navBtn(IconData icon, String label, int i) {
+    final sel = _tabs.index == i;
+    final color = sel ? agGold : Colors.white70;
+    return InkWell(
+      focusColor: agGold.withOpacity(0.25),
+      onTap: () {
+        _tabs.index = i;
+        setState(() => _category = 'Todas');
+      },
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(vertical: 12),
+        color: sel ? agGold.withOpacity(0.15) : Colors.transparent,
+        child: Column(
+          children: [
+            Icon(icon, color: color),
+            const SizedBox(height: 4),
+            Text(label, style: TextStyle(color: color, fontSize: 11)),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _sideMenu() {
+    return Container(
+      width: 84,
+      color: agPanel,
+      child: SingleChildScrollView(
+        child: Column(
+          children: [
+            const SizedBox(height: 4),
+            IconButton(
+              icon: const Icon(Icons.arrow_back, color: agGold),
+              onPressed: () => Navigator.of(context).maybePop(),
+            ),
+            const SizedBox(height: 4),
+            _navBtn(Icons.live_tv, 'Ao vivo', 0),
+            _navBtn(Icons.movie, 'Filmes', 1),
+            _navBtn(Icons.video_library, 'Séries', 2),
+            _navBtn(Icons.favorite, 'Favoritos', 3),
+          ],
+        ),
+      ),
     );
   }
 
@@ -910,7 +1168,27 @@ class _SectionScreenState extends State<SectionScreen>
       );
     }
 
-    final wide = MediaQuery.of(context).size.width >= 900;
+    final wide = MediaQuery.of(context).size.width >= 640;
+
+    if (wide) {
+      return Scaffold(
+        backgroundColor: agBlack,
+        body: SafeArea(
+          child: Row(
+            children: [
+              _sideMenu(),
+              Expanded(flex: 4, child: _listArea(tabs: false)),
+              Expanded(
+                flex: 6,
+                child: SingleChildScrollView(
+                  child: _playerArea(wide: true),
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
 
     return Scaffold(
       backgroundColor: agBlack,
@@ -923,22 +1201,12 @@ class _SectionScreenState extends State<SectionScreen>
           style: const TextStyle(fontSize: 15),
         ),
       ),
-      body: wide
-          ? Row(
-              children: [
-                Expanded(flex: 4, child: _listArea()),
-                Expanded(
-                  flex: 6,
-                  child: SingleChildScrollView(child: _playerArea()),
-                ),
-              ],
-            )
-          : Column(
-              children: [
-                _playerArea(),
-                Expanded(child: _listArea()),
-              ],
-            ),
+      body: Column(
+        children: [
+          _playerArea(wide: false),
+          Expanded(child: _listArea(tabs: true)),
+        ],
+      ),
     );
   }
 }

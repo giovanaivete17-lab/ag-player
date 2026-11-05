@@ -10,7 +10,15 @@ import '../../data/profiles/favorites_store.dart';
 import '../../data/profiles/iptv_api.dart';
 import '../../data/profiles/profile.dart';
 import '../../data/profiles/progress_store.dart';
+import '../../data/profiles/series_api.dart';
 import '../theme.dart';
+
+class _Media {
+  final String name;
+  final String url;
+  final bool live;
+  const _Media(this.name, this.url, this.live);
+}
 
 class SectionScreen extends StatefulWidget {
   final Profile profile;
@@ -32,17 +40,22 @@ class _SectionScreenState extends State<SectionScreen>
   late final TabController _tabs;
   late final Player _player;
   late final VideoController _video;
+  late final Future<void> _cfg;
   final _search = TextEditingController();
   final List<StreamSubscription> _subs = [];
   final _posN = ValueNotifier<Duration>(Duration.zero);
   final _durN = ValueNotifier<Duration>(Duration.zero);
   final Map<int, List<String>> _catCache = {};
+  final Map<int, String> _fKey = {};
+  final Map<int, List<Item>> _fVal = {};
 
   String _query = '';
   String _category = 'Todas';
-  Item? _current;
-  List<Item> _queue = [];
+  _Media? _current;
+  List<_Media> _queue = [];
   List<Item> _favs = [];
+  List<String> _cands = [];
+  int _ci = 0;
   int _qIndex = -1;
   bool _full = false;
   bool _controls = true;
@@ -53,6 +66,7 @@ class _SectionScreenState extends State<SectionScreen>
   String? _error;
   DateTime _lastSave = DateTime.fromMillisecondsSinceEpoch(0);
   Timer? _hideTimer;
+  Timer? _openTimer;
 
   @override
   void initState() {
@@ -71,11 +85,15 @@ class _SectionScreenState extends State<SectionScreen>
     FavoritesStore.changes.addListener(_loadFavs);
     _loadFavs();
 
-    _player = Player();
+    _player = Player(
+      configuration: const PlayerConfiguration(bufferSize: 24 * 1024 * 1024),
+    );
     _video = VideoController(_player);
+    _cfg = _configurePlayer();
 
     _subs.add(_player.stream.position.listen((p) {
       _posN.value = p;
+      if (p > Duration.zero) _openTimer?.cancel();
       final now = DateTime.now();
       if (now.difference(_lastSave) > const Duration(seconds: 10)) {
         _lastSave = now;
@@ -90,12 +108,9 @@ class _SectionScreenState extends State<SectionScreen>
       if (mounted) setState(() => _buffering = v);
     }));
     _subs.add(_player.stream.error.listen((e) {
-      if (mounted && e.toString().isNotEmpty) {
-        setState(() {
-          _error = 'Não foi possível tocar este item.';
-          _buffering = false;
-        });
-      }
+      if (!mounted || e.toString().isEmpty) return;
+      if (_posN.value > const Duration(seconds: 3)) return;
+      _failOver();
     }));
     _subs.add(_player.stream.completed.listen((c) {
       if (c && _queue.isNotEmpty && _qIndex < _queue.length - 1) {
@@ -107,6 +122,7 @@ class _SectionScreenState extends State<SectionScreen>
   @override
   void dispose() {
     _hideTimer?.cancel();
+    _openTimer?.cancel();
     FavoritesStore.changes.removeListener(_loadFavs);
     for (final s in _subs) {
       s.cancel();
@@ -123,6 +139,27 @@ class _SectionScreenState extends State<SectionScreen>
     super.dispose();
   }
 
+  Future<void> _configurePlayer() async {
+    final pl = _player.platform;
+    if (pl is NativePlayer) {
+      Future<void> set(String k, String v) async {
+        try {
+          await pl.setProperty(k, v);
+        } catch (_) {}
+      }
+
+      await set('user-agent', 'VLC/3.0.20 LibVLC/3.0.20');
+      await set('tls-verify', 'no');
+      await set('network-timeout', '20');
+      await set(
+        'stream-lavf-o',
+        'reconnect=1,reconnect_streamed=1,reconnect_delay_max=5',
+      );
+      await set('cache', 'yes');
+      await set('demuxer-readahead-secs', '20');
+    }
+  }
+
   // ---------- favoritos ----------
 
   Future<void> _loadFavs() async {
@@ -136,13 +173,13 @@ class _SectionScreenState extends State<SectionScreen>
   // ---------- progresso ----------
 
   Future<void> _saveNow() async {
-    final it = _current;
-    if (it == null || it.kind == Kind.live) return;
+    final m = _current;
+    if (m == null || m.live) return;
     final p = _posN.value;
     final d = _durN.value;
     if (d < const Duration(minutes: 5)) return;
     try {
-      await ProgressStore.save(it.url, p, d);
+      await ProgressStore.save(m.url, p, d);
     } catch (_) {}
   }
 
@@ -156,11 +193,56 @@ class _SectionScreenState extends State<SectionScreen>
 
   // ---------- player ----------
 
-  Future<void> _play(Item it, {List<Item>? queue, int index = -1}) async {
-    await _saveNow();
+  _Media _media(Item it) =>
+      _Media(it.name, it.url, it.kind == Kind.live);
+
+  List<String> _candidatesFor(_Media m) {
+    final u = m.url;
+    final out = <String>[u];
+    if (m.live) {
+      if (u.endsWith('.ts')) {
+        out.add('${u.substring(0, u.length - 3)}.m3u8');
+      } else if (u.endsWith('.m3u8')) {
+        out.add('${u.substring(0, u.length - 5)}.ts');
+      }
+    }
+    return out;
+  }
+
+  Future<void> _openUrl(String u) async {
+    try {
+      await _player.open(Media(u), play: true);
+      _openTimer?.cancel();
+      _openTimer = Timer(const Duration(seconds: 25), () {
+        if (mounted && _posN.value == Duration.zero) _failOver();
+      });
+    } catch (_) {
+      _failOver();
+    }
+  }
+
+  void _failOver() {
+    _openTimer?.cancel();
+    if (_ci + 1 < _cands.length) {
+      _ci++;
+      _openUrl(_cands[_ci]);
+      return;
+    }
     if (!mounted) return;
     setState(() {
-      _current = it;
+      _buffering = false;
+      _error = (_current?.live ?? false)
+          ? 'Canal indisponível no momento.'
+          : 'Não foi possível tocar este item.';
+    });
+  }
+
+  Future<void> _play(_Media m, {List<_Media>? queue, int index = -1}) async {
+    await _saveNow();
+    if (!mounted) return;
+    _openTimer?.cancel();
+    setState(() {
+      _current = m;
       _error = null;
       _buffering = true;
       _queue = queue ?? [];
@@ -168,19 +250,12 @@ class _SectionScreenState extends State<SectionScreen>
     });
     _posN.value = Duration.zero;
     _durN.value = Duration.zero;
-    try {
-      await _player.open(Media(it.url), play: true);
-    } catch (_) {
-      if (mounted) {
-        setState(() {
-          _error = 'Não foi possível tocar este item.';
-          _buffering = false;
-        });
-      }
-      return;
-    }
-    if (it.kind != Kind.live) {
-      final saved = await _loadSaved(it.url);
+    _cands = _candidatesFor(m);
+    _ci = 0;
+    await _cfg;
+    await _openUrl(_cands[0]);
+    if (!m.live) {
+      final saved = await _loadSaved(m.url);
       if (saved != null && saved > const Duration(seconds: 10)) {
         try {
           if (_player.state.duration == Duration.zero) {
@@ -188,7 +263,7 @@ class _SectionScreenState extends State<SectionScreen>
                 .firstWhere((d) => d > Duration.zero)
                 .timeout(const Duration(seconds: 15));
           }
-          await _player.seek(saved);
+          if (identical(_current, m)) await _player.seek(saved);
         } catch (_) {}
       }
     }
@@ -235,6 +310,36 @@ class _SectionScreenState extends State<SectionScreen>
     await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
   }
 
+  KeyEventResult _onKey(FocusNode node, KeyEvent e) {
+    if (!_full || e is! KeyDownEvent) return KeyEventResult.ignored;
+    final k = e.logicalKey;
+    final live = _current?.live ?? true;
+    if (k == LogicalKeyboardKey.arrowRight) {
+      if (!live) _seekBy(const Duration(seconds: 10));
+      _showControls();
+      return KeyEventResult.handled;
+    }
+    if (k == LogicalKeyboardKey.arrowLeft) {
+      if (!live) _seekBy(const Duration(seconds: -10));
+      _showControls();
+      return KeyEventResult.handled;
+    }
+    if (k == LogicalKeyboardKey.arrowUp ||
+        k == LogicalKeyboardKey.arrowDown) {
+      _showControls();
+      return KeyEventResult.handled;
+    }
+    if (k == LogicalKeyboardKey.select ||
+        k == LogicalKeyboardKey.enter ||
+        k == LogicalKeyboardKey.space ||
+        k == LogicalKeyboardKey.mediaPlayPause) {
+      _player.playOrPause();
+      _showControls();
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
   String _fmt(Duration d) {
     final h = d.inHours;
     final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
@@ -252,65 +357,129 @@ class _SectionScreenState extends State<SectionScreen>
 
   Future<void> _openSeries(Item s) async {
     _snack('Carregando episódios...');
-    try {
-      final eps = List<Item>.from(
-        await IptvApi.episodes(widget.profile, s),
-      );
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).hideCurrentSnackBar();
-      if (eps.isEmpty) {
-        _snack('Nenhum episódio encontrado.');
-        return;
+    final flat = <_Media>[];
+    final seasonOf = <int>[];
+    String? why;
+
+    if (SeriesApi.canLoad(widget.profile)) {
+      try {
+        final eps = await SeriesApi.load(widget.profile, s.id.toString());
+        for (final e in eps) {
+          flat.add(_Media('E${e.number} · ${e.title}', e.url, false));
+          seasonOf.add(e.season);
+        }
+      } catch (e) {
+        why = e.toString().replaceFirst('Exception: ', '');
       }
-      final h = MediaQuery.of(context).size.height * 0.7;
-      final chosen = await showModalBottomSheet<int>(
-        context: context,
-        backgroundColor: agPanel,
-        isScrollControlled: true,
-        builder: (ctx) => SafeArea(
-          child: ConstrainedBox(
-            constraints: BoxConstraints(maxHeight: h),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Padding(
-                  padding: const EdgeInsets.all(14),
-                  child: Text(
-                    s.name,
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      color: agGold,
-                      fontSize: 16,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                ),
-                Flexible(
-                  child: ListView.builder(
-                    shrinkWrap: true,
-                    itemCount: eps.length,
-                    itemBuilder: (_, i) => ListTile(
-                      dense: true,
-                      title: Text(
-                        eps[i].name,
-                        style: const TextStyle(color: Colors.white),
-                      ),
-                      onTap: () => Navigator.pop(ctx, i),
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-      );
-      if (chosen != null) {
-        _play(eps[chosen], queue: eps, index: chosen);
-      }
-    } catch (e) {
-      _snack('Não foi possível carregar os episódios.');
     }
+    if (flat.isEmpty) {
+      try {
+        final eps = List<Item>.from(
+          await IptvApi.episodes(widget.profile, s),
+        );
+        for (final e in eps) {
+          flat.add(_Media(e.name, e.url, false));
+          seasonOf.add(1);
+        }
+      } catch (e) {
+        why ??= e.toString().replaceFirst('Exception: ', '');
+      }
+    }
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).hideCurrentSnackBar();
+    if (flat.isEmpty) {
+      _snack(why ?? 'Nenhum episódio encontrado.');
+      return;
+    }
+
+    final seasons = seasonOf.toSet().toList()..sort();
+    final h = MediaQuery.of(context).size.height * 0.75;
+    final pick = await showModalBottomSheet<int>(
+      context: context,
+      backgroundColor: agPanel,
+      isScrollControlled: true,
+      builder: (ctx) {
+        var sel = seasons.first;
+        return StatefulBuilder(builder: (ctx, setM) {
+          final idxs = <int>[
+            for (var i = 0; i < flat.length; i++)
+              if (seasonOf[i] == sel) i,
+          ];
+          return SafeArea(
+            child: ConstrainedBox(
+              constraints: BoxConstraints(maxHeight: h),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.all(14),
+                    child: Text(
+                      s.name,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: agGold,
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ),
+                  if (seasons.length > 1)
+                    SizedBox(
+                      height: 44,
+                      child: ListView(
+                        scrollDirection: Axis.horizontal,
+                        padding: const EdgeInsets.symmetric(horizontal: 8),
+                        children: [
+                          for (final se in seasons)
+                            Padding(
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 3, vertical: 4),
+                              child: ChoiceChip(
+                                label: Text(
+                                  'Temporada $se',
+                                  style: TextStyle(
+                                    color: se == sel
+                                        ? Colors.black
+                                        : Colors.white,
+                                    fontSize: 12,
+                                  ),
+                                ),
+                                selected: se == sel,
+                                selectedColor: agGold,
+                                backgroundColor: agBlack,
+                                onSelected: (_) => setM(() => sel = se),
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
+                  Flexible(
+                    child: ListView.builder(
+                      shrinkWrap: true,
+                      itemCount: idxs.length,
+                      itemBuilder: (_, k) {
+                        final gi = idxs[k];
+                        return ListTile(
+                          dense: true,
+                          focusColor: agGold.withOpacity(0.25),
+                          title: Text(
+                            flat[gi].name,
+                            style: const TextStyle(color: Colors.white),
+                          ),
+                          onTap: () => Navigator.pop(ctx, gi),
+                        );
+                      },
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        });
+      },
+    );
+    if (pick != null) _play(flat[pick], queue: flat, index: pick);
   }
 
   void _onTapItem(Item it) {
@@ -322,7 +491,7 @@ class _SectionScreenState extends State<SectionScreen>
       _enterFull();
       return;
     }
-    _play(it);
+    _play(_media(it));
   }
 
   // ---------- listas ----------
@@ -352,6 +521,20 @@ class _SectionScreenState extends State<SectionScreen>
     return l;
   }
 
+  List<Item> _filtered(int tab, List<Item> all, String cat) {
+    final key = '$cat|$_query|${all.length}|${identityHashCode(all)}';
+    if (_fKey[tab] == key) return _fVal[tab]!;
+    final r = all.where((it) {
+      if (cat != 'Todas' && it.category.toString().trim() != cat) {
+        return false;
+      }
+      return _query.isEmpty || it.name.toLowerCase().contains(_query);
+    }).toList();
+    _fKey[tab] = key;
+    _fVal[tab] = r;
+    return r;
+  }
+
   Widget _logo(Item it) {
     final l = it.logo;
     final fallback = const Icon(Icons.play_circle_outline, color: agGold);
@@ -366,6 +549,7 @@ class _SectionScreenState extends State<SectionScreen>
                 l,
                 fit: BoxFit.cover,
                 cacheWidth: 100,
+                gaplessPlayback: true,
                 errorBuilder: (_, __, ___) => fallback,
               ),
       ),
@@ -377,6 +561,7 @@ class _SectionScreenState extends State<SectionScreen>
     final pid = widget.profile.id;
     return ListTile(
       dense: true,
+      focusColor: agGold.withOpacity(0.25),
       leading: _logo(it),
       title: Text(
         it.name,
@@ -411,12 +596,7 @@ class _SectionScreenState extends State<SectionScreen>
     final all = _itemsForTab(tab);
     final cats = _categories(tab, all);
     final cat = cats.contains(_category) ? _category : 'Todas';
-    final list = all.where((it) {
-      if (cat != 'Todas' && it.category.toString().trim() != cat) {
-        return false;
-      }
-      return _query.isEmpty || it.name.toLowerCase().contains(_query);
-    }).toList();
+    final list = _filtered(tab, all, cat);
 
     return Column(
       children: [
@@ -469,13 +649,11 @@ class _SectionScreenState extends State<SectionScreen>
     );
   }
 
-  Widget _page(int tab) => _pageBody(tab);
-
   // ---------- controles ----------
 
   Widget _controlsPanel() {
     final cur = _current;
-    final live = cur?.kind == Kind.live;
+    final live = cur?.live ?? false;
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
@@ -611,7 +789,7 @@ class _SectionScreenState extends State<SectionScreen>
                   style: TextStyle(color: Colors.white54),
                 ),
               ),
-            if (_buffering && _error == null)
+            if (_buffering && _error == null && _current != null)
               const Center(child: CircularProgressIndicator(color: agGold)),
             if (_error != null)
               Center(
@@ -640,6 +818,79 @@ class _SectionScreenState extends State<SectionScreen>
     );
   }
 
+  Widget _playerArea() {
+    final cur = _current;
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        AspectRatio(aspectRatio: 16 / 9, child: _videoBox()),
+        if (cur != null)
+          Container(
+            width: double.infinity,
+            color: agPanel,
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+            child: Text(
+              cur.name,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(color: Colors.white, fontSize: 13),
+            ),
+          ),
+        Container(
+          width: double.infinity,
+          color: agPanel,
+          child: _controlsPanel(),
+        ),
+      ],
+    );
+  }
+
+  Widget _listArea() {
+    return Column(
+      children: [
+        TabBar(
+          controller: _tabs,
+          labelColor: agGold,
+          unselectedLabelColor: Colors.white70,
+          indicatorColor: agGold,
+          tabs: const [
+            Tab(text: 'Ao vivo'),
+            Tab(text: 'Filmes'),
+            Tab(text: 'Séries'),
+            Tab(text: 'Favoritos'),
+          ],
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(10, 8, 10, 0),
+          child: TextField(
+            controller: _search,
+            style: const TextStyle(color: Colors.white),
+            onChanged: (v) =>
+                setState(() => _query = v.trim().toLowerCase()),
+            decoration: InputDecoration(
+              isDense: true,
+              filled: true,
+              fillColor: agPanel,
+              hintText: 'Buscar',
+              hintStyle: const TextStyle(color: Colors.white38),
+              prefixIcon: const Icon(Icons.search, color: agGold),
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(8),
+                borderSide: BorderSide.none,
+              ),
+            ),
+          ),
+        ),
+        Expanded(
+          child: TabBarView(
+            controller: _tabs,
+            children: [for (var i = 0; i < 4; i++) _pageBody(i)],
+          ),
+        ),
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     if (_full) {
@@ -650,10 +901,16 @@ class _SectionScreenState extends State<SectionScreen>
         },
         child: Scaffold(
           backgroundColor: Colors.black,
-          body: _videoBox(),
+          body: Focus(
+            autofocus: true,
+            onKeyEvent: _onKey,
+            child: _videoBox(),
+          ),
         ),
       );
     }
+
+    final wide = MediaQuery.of(context).size.width >= 900;
 
     return Scaffold(
       backgroundColor: agBlack,
@@ -666,51 +923,22 @@ class _SectionScreenState extends State<SectionScreen>
           style: const TextStyle(fontSize: 15),
         ),
       ),
-      body: Column(
-        children: [
-          AspectRatio(aspectRatio: 16 / 9, child: _videoBox()),
-          Container(color: agPanel, child: _controlsPanel()),
-          TabBar(
-            controller: _tabs,
-            labelColor: agGold,
-            unselectedLabelColor: Colors.white70,
-            indicatorColor: agGold,
-            tabs: const [
-              Tab(text: 'Ao vivo'),
-              Tab(text: 'Filmes'),
-              Tab(text: 'Séries'),
-              Tab(text: 'Favoritos'),
-            ],
-          ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(10, 8, 10, 0),
-            child: TextField(
-              controller: _search,
-              style: const TextStyle(color: Colors.white),
-              onChanged: (v) =>
-                  setState(() => _query = v.trim().toLowerCase()),
-              decoration: InputDecoration(
-                isDense: true,
-                filled: true,
-                fillColor: agPanel,
-                hintText: 'Buscar',
-                hintStyle: const TextStyle(color: Colors.white38),
-                prefixIcon: const Icon(Icons.search, color: agGold),
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(8),
-                  borderSide: BorderSide.none,
+      body: wide
+          ? Row(
+              children: [
+                Expanded(flex: 4, child: _listArea()),
+                Expanded(
+                  flex: 6,
+                  child: SingleChildScrollView(child: _playerArea()),
                 ),
-              ),
+              ],
+            )
+          : Column(
+              children: [
+                _playerArea(),
+                Expanded(child: _listArea()),
+              ],
             ),
-          ),
-          Expanded(
-            child: TabBarView(
-              controller: _tabs,
-              children: [for (var i = 0; i < 4; i++) _page(i)],
-            ),
-          ),
-        ],
-      ),
     );
   }
 }

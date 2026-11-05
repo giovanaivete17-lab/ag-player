@@ -42,6 +42,7 @@ class _SectionScreenState extends State<SectionScreen>
   String _category = 'Todas';
   Item? _current;
   List<Item> _queue = [];
+  List<Item> _favs = [];
   int _qIndex = -1;
   bool _full = false;
   bool _controls = true;
@@ -67,6 +68,9 @@ class _SectionScreenState extends State<SectionScreen>
         setState(() => _category = 'Todas');
       }
     });
+    FavoritesStore.changes.addListener(_loadFavs);
+    _loadFavs();
+
     _player = Player();
     _video = VideoController(_player);
 
@@ -103,6 +107,7 @@ class _SectionScreenState extends State<SectionScreen>
   @override
   void dispose() {
     _hideTimer?.cancel();
+    FavoritesStore.changes.removeListener(_loadFavs);
     for (final s in _subs) {
       s.cancel();
     }
@@ -116,6 +121,16 @@ class _SectionScreenState extends State<SectionScreen>
     _posN.dispose();
     _durN.dispose();
     super.dispose();
+  }
+
+  // ---------- favoritos ----------
+
+  Future<void> _loadFavs() async {
+    try {
+      final l = await FavoritesStore.all(widget.profile.id);
+      if (!mounted) return;
+      setState(() => _favs = List<Item>.from(l));
+    } catch (_) {}
   }
 
   // ---------- progresso ----------
@@ -321,7 +336,7 @@ class _SectionScreenState extends State<SectionScreen>
       case 2:
         return widget.catalog.series;
       default:
-        return List<Item>.from(FavoritesStore.all(widget.profile.id));
+        return _favs;
     }
   }
 
@@ -454,15 +469,7 @@ class _SectionScreenState extends State<SectionScreen>
     );
   }
 
-  Widget _page(int tab) {
-    if (tab == 3) {
-      return ValueListenableBuilder(
-        valueListenable: FavoritesStore.changes,
-        builder: (_, __, ___) => _pageBody(3),
-      );
-    }
-    return _pageBody(tab);
-  }
+  Widget _page(int tab) => _pageBody(tab);
 
   // ---------- controles ----------
 

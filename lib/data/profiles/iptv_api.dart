@@ -1,5 +1,8 @@
+import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:isolate';
+import 'dart:typed_data';
 import 'package:dio/dio.dart';
 import '../../domain/entities/channel.dart';
 import '../parsers/m3u_parser.dart';
@@ -45,9 +48,210 @@ class IptvException implements Exception {
   String toString() => message;
 }
 
+// ---------- Cache em disco (roda em segundo plano) ----------
+
+String _strip(String url, String user, String pass) {
+  if (user.isEmpty || pass.isEmpty) return url;
+  return url.replaceFirst('/$user/$pass/', '/{U}/');
+}
+
+String _unstrip(String url, String user, String pass) {
+  if (user.isEmpty || pass.isEmpty) return url;
+  return url.replaceFirst('/{U}/', '/$user/$pass/');
+}
+
+List<List<String>> _encItems(List<Item> l, String user, String pass) {
+  return [
+    for (final i in l)
+      [i.id, i.name, _strip(i.url, user, pass), i.logo ?? '', i.category],
+  ];
+}
+
+List<Item> _decItems(dynamic l, Kind k, String user, String pass) {
+  final out = <Item>[];
+  if (l is! List) return out;
+  for (final e in l) {
+    if (e is! List || e.length < 5) continue;
+    final logo = e[3] as String;
+    out.add(Item(
+      id: e[0] as String,
+      name: e[1] as String,
+      url: _unstrip(e[2] as String, user, pass),
+      logo: logo.isEmpty ? null : logo,
+      category: e[4] as String,
+      kind: k,
+    ));
+  }
+  return out;
+}
+
+void _writeCacheSync(String path, Catalog c, String user, String pass) {
+  try {
+    final data = jsonEncode({
+      'v': 1,
+      'x': (user.isNotEmpty && pass.isNotEmpty) ? 1 : 0,
+      'l': _encItems(c.live, user, pass),
+      'm': _encItems(c.movies, user, pass),
+      's': _encItems(c.series, user, pass),
+    });
+    final tmp = File('$path.tmp');
+    tmp.writeAsStringSync(data, flush: true);
+    tmp.renameSync(path);
+  } catch (_) {}
+}
+
+class _CacheReq {
+  final String path;
+  final String user;
+  final String pass;
+  const _CacheReq(this.path, this.user, this.pass);
+}
+
+class _CacheRead {
+  final Catalog catalog;
+  final int ageMin;
+  const _CacheRead(this.catalog, this.ageMin);
+}
+
+_CacheRead? _readCacheSync(_CacheReq r) {
+  try {
+    final f = File(r.path);
+    if (!f.existsSync()) return null;
+    final age = DateTime.now().difference(f.lastModifiedSync()).inMinutes;
+    final j = jsonDecode(f.readAsStringSync());
+    if (j is! Map || j['v'] != 1) return null;
+    final u = j['x'] == 1 ? r.user : '';
+    final p = j['x'] == 1 ? r.pass : '';
+    final live = _decItems(j['l'], Kind.live, u, p);
+    final movies = _decItems(j['m'], Kind.movie, u, p);
+    final series = _decItems(j['s'], Kind.series, u, p);
+    if (live.isEmpty && movies.isEmpty && series.isEmpty) return null;
+    return _CacheRead(
+        Catalog(live: live, movies: movies, series: series), age);
+  } catch (_) {
+    return null;
+  }
+}
+
+// ---------- Leitura Xtream (roda em segundo plano) ----------
+
+class _XIn {
+  final String base;
+  final String user;
+  final String pass;
+  final String ext;
+  final String cachePath;
+  final List<TransferableTypedData> raw;
+  const _XIn({
+    required this.base,
+    required this.user,
+    required this.pass,
+    required this.ext,
+    required this.cachePath,
+    required this.raw,
+  });
+}
+
+Catalog _buildXtream(_XIn a) {
+  List<dynamic> dec(int i) {
+    try {
+      final bytes = a.raw[i].materialize().asUint8List();
+      if (bytes.isEmpty) return const <dynamic>[];
+      final v = jsonDecode(utf8.decode(bytes, allowMalformed: true));
+      return v is List ? v : const <dynamic>[];
+    } catch (_) {
+      return const <dynamic>[];
+    }
+  }
+
+  String s(dynamic v) => v == null ? '' : v.toString().trim();
+
+  Map<String, String> cats(List<dynamic> l) {
+    final m = <String, String>{};
+    for (final e in l) {
+      if (e is Map) m[s(e['category_id'])] = s(e['category_name']);
+    }
+    return m;
+  }
+
+  String catName(Map<String, String> m, dynamic id) {
+    final n = m[s(id)];
+    return (n == null || n.isEmpty) ? 'Sem categoria' : n;
+  }
+
+  final liveCats = cats(dec(0));
+  final vodCats = cats(dec(1));
+  final serCats = cats(dec(2));
+
+  final live = <Item>[];
+  for (final e in dec(3)) {
+    if (e is! Map) continue;
+    final id = s(e['stream_id']);
+    if (id.isEmpty) continue;
+    final icon = s(e['stream_icon']);
+    live.add(Item(
+      id: id,
+      name: s(e['name']),
+      url: '${a.base}/live/${a.user}/${a.pass}/$id.${a.ext}',
+      logo: icon.isEmpty ? null : icon,
+      category: catName(liveCats, e['category_id']),
+      kind: Kind.live,
+    ));
+  }
+
+  final movies = <Item>[];
+  for (final e in dec(4)) {
+    if (e is! Map) continue;
+    final id = s(e['stream_id']);
+    if (id.isEmpty) continue;
+    final icon = s(e['stream_icon']);
+    var ext = s(e['container_extension']);
+    if (ext.isEmpty) ext = 'mp4';
+    movies.add(Item(
+      id: id,
+      name: s(e['name']),
+      url: '${a.base}/movie/${a.user}/${a.pass}/$id.$ext',
+      logo: icon.isEmpty ? null : icon,
+      category: catName(vodCats, e['category_id']),
+      kind: Kind.movie,
+    ));
+  }
+
+  final series = <Item>[];
+  for (final e in dec(5)) {
+    if (e is! Map) continue;
+    final id = s(e['series_id']);
+    if (id.isEmpty) continue;
+    final cover = s(e['cover']);
+    series.add(Item(
+      id: id,
+      name: s(e['name']),
+      url: '',
+      logo: cover.isEmpty ? null : cover,
+      category: catName(serCats, e['category_id']),
+      kind: Kind.series,
+    ));
+  }
+
+  final cat = Catalog(live: live, movies: movies, series: series);
+  if (a.cachePath.isNotEmpty &&
+      (live.isNotEmpty || movies.isNotEmpty || series.isNotEmpty)) {
+    _writeCacheSync(a.cachePath, cat, a.user, a.pass);
+  }
+  return cat;
+}
+
 class IptvApi {
+  /// Servidor fixo do app.
+  static const String defaultServer = 'http://alphafantasma.top';
+
+  /// Atualiza a lista em segundo plano depois de tantos minutos.
+  static const int cacheTtlMin = 360;
+
   /// Formato do canal ao vivo: 'ts' ou 'm3u8'.
   static String liveExt = 'ts';
+
+  static final Set<String> _busy = <String>{};
 
   static final Dio _dio = Dio(BaseOptions(
     connectTimeout: const Duration(seconds: 25),
@@ -56,6 +260,7 @@ class IptvApi {
   ));
 
   static String _s(dynamic v) => v == null ? '' : v.toString().trim();
+  static String _n(dynamic v) => v == null ? '' : v.toString();
 
   static String _fixUrl(String raw) {
     var b = raw.trim();
@@ -66,7 +271,8 @@ class IptvApi {
   }
 
   static String _xBase(String raw) {
-    final uri = Uri.parse(_fixUrl(raw));
+    final r = raw.trim();
+    final uri = Uri.parse(_fixUrl(r.isEmpty ? defaultServer : r));
     final port = uri.hasPort ? ':${uri.port}' : '';
     return '${uri.scheme}://${uri.host}$port';
   }
@@ -99,37 +305,106 @@ class IptvApi {
     }
   }
 
-  static Future<Catalog> load(Profile p) async {
+  static String _fnv(String s) {
+    var h = 0x811c9dc5;
+    for (final c in s.codeUnits) {
+      h ^= c;
+      h = (h * 0x01000193) & 0xFFFFFFFF;
+    }
+    return h.toRadixString(16);
+  }
+
+  static String? _cachePath(Profile p) {
     try {
-      if (p.type == 'xtream') return await _loadXtream(p);
+      final key = _fnv(
+          '${p.type}|${p.url}|${_n(p.user)}|${_n(p.pass)}|$liveExt');
+      return '${Directory.systemTemp.path}${Platform.pathSeparator}'
+          'agplayer_$key.json';
+    } catch (_) {
+      return null;
+    }
+  }
 
-      // Link M3U do tipo get.php?username=..&password=.. -> tenta como Xtream
+  /// Link get.php?username=..&password=.. vira perfil Xtream.
+  static Profile _effective(Profile p) {
+    if (p.type == 'xtream') return p;
+    try {
+      final uri = Uri.parse(_fixUrl(p.url));
+      final u = uri.queryParameters['username'];
+      final pw = uri.queryParameters['password'];
+      if (uri.path.contains('get.php') &&
+          u != null &&
+          u.isNotEmpty &&
+          pw != null &&
+          pw.isNotEmpty) {
+        return Profile(
+          id: p.id,
+          name: p.name,
+          type: 'xtream',
+          url: _xBase(p.url),
+          user: u,
+          pass: pw,
+        );
+      }
+    } catch (_) {}
+    return p;
+  }
+
+  /// Abre a lista. Se já existe uma cópia no aparelho, devolve na hora e
+  /// atualiza em segundo plano (chama [onFresh] quando terminar).
+  static Future<Catalog> load(
+    Profile p, {
+    void Function(Catalog)? onFresh,
+  }) async {
+    final path = _cachePath(p);
+    if (path != null) {
+      final eff = _effective(p);
+      final req = _CacheReq(path, _n(eff.user), _n(eff.pass));
+      _CacheRead? cached;
       try {
-        final uri = Uri.parse(_fixUrl(p.url));
-        final u = uri.queryParameters['username'];
-        final pw = uri.queryParameters['password'];
-        if (uri.path.contains('get.php') &&
-            u != null &&
-            u.isNotEmpty &&
-            pw != null &&
-            pw.isNotEmpty) {
-          final x = Profile(
-            id: p.id,
-            name: p.name,
-            type: 'xtream',
-            url: _xBase(p.url),
-            user: u,
-            pass: pw,
-          );
-          try {
-            return await _loadXtream(x);
-          } catch (_) {
-            // cai para a leitura normal do M3U
-          }
-        }
-      } catch (_) {}
+        cached = await Isolate.run(() => _readCacheSync(req));
+      } catch (_) {
+        cached = null;
+      }
+      if (cached != null) {
+        if (cached.ageMin >= cacheTtlMin) _refresh(p, path, onFresh);
+        return cached.catalog;
+      }
+    }
+    return _fetch(p, path);
+  }
 
-      return await _loadM3u(p);
+  static void _refresh(
+    Profile p,
+    String path,
+    void Function(Catalog)? onFresh,
+  ) {
+    if (_busy.contains(path)) return;
+    _busy.add(path);
+    () async {
+      try {
+        final c = await _fetch(p, path);
+        onFresh?.call(c);
+      } catch (_) {
+        // sem internet agora: continua com a cópia antiga
+      } finally {
+        _busy.remove(path);
+      }
+    }();
+  }
+
+  static Future<Catalog> _fetch(Profile p, String? cachePath) async {
+    try {
+      final eff = _effective(p);
+      if (eff.type == 'xtream') {
+        if (identical(eff, p)) return await _loadXtream(eff, cachePath);
+        try {
+          return await _loadXtream(eff, cachePath);
+        } catch (_) {
+          // cai para a leitura normal do M3U
+        }
+      }
+      return await _loadM3u(p, cachePath);
     } on DioException catch (e) {
       throw IptvException(_dioMsg(e));
     }
@@ -147,7 +422,7 @@ class IptvApi {
         path.endsWith('.flv');
   }
 
-  static Future<Catalog> _loadM3u(Profile p) async {
+  static Future<Catalog> _loadM3u(Profile p, String? cachePath) async {
     final res = await _dio.get<String>(
       _fixUrl(p.url),
       options: Options(responseType: ResponseType.plain),
@@ -206,7 +481,12 @@ class IptvApi {
     if (live.isEmpty && movies.isEmpty && series.isEmpty) {
       throw const IptvException('Nenhum canal encontrado nessa lista.');
     }
-    return Catalog(live: live, movies: movies, series: series);
+    final cat = Catalog(live: live, movies: movies, series: series);
+    if (cachePath != null) {
+      unawaited(Isolate.run(() => _writeCacheSync(cachePath, cat, '', ''))
+          .then<void>((_) {}, onError: (_) {}));
+    }
+    return cat;
   }
 
   // ---------------- Xtream ----------------
@@ -237,52 +517,37 @@ class IptvApi {
     }
   }
 
-  static Future<List<dynamic>> _getList(
+  static Future<Uint8List> _getBytes(
     String base,
     Profile p,
     String action,
   ) async {
-    final res = await _dio.get<String>(
+    final res = await _dio.get<List<int>>(
       '$base/player_api.php',
       queryParameters: {
         'username': p.user,
         'password': p.pass,
         'action': action,
       },
-      options: Options(responseType: ResponseType.plain),
+      options: Options(responseType: ResponseType.bytes),
     );
-    final data = await _decode(res.data ?? '');
-    if (data is List) return data;
-    return <dynamic>[];
+    final d = res.data;
+    if (d == null) return Uint8List(0);
+    return d is Uint8List ? d : Uint8List.fromList(d);
   }
 
-  static Map<String, String> _cats(List<dynamic> l) {
-    final m = <String, String>{};
-    for (final e in l) {
-      if (e is Map) {
-        m[_s(e['category_id'])] = _s(e['category_name']);
-      }
-    }
-    return m;
-  }
-
-  static String _catName(Map<String, String> cats, dynamic id) {
-    final n = cats[_s(id)];
-    return (n == null || n.isEmpty) ? 'Sem categoria' : n;
-  }
-
-  static Future<Catalog> _loadXtream(Profile p) async {
+  static Future<Catalog> _loadXtream(Profile p, String? cachePath) async {
     final base = _xBase(p.url);
     await _auth(base, p);
 
     Object? err;
 
-    Future<List<dynamic>> safe(String action) async {
+    Future<Uint8List> safe(String action) async {
       try {
-        return await _getList(base, p, action);
+        return await _getBytes(base, p, action);
       } catch (e) {
         err ??= e;
-        return <dynamic>[];
+        return Uint8List(0);
       }
     }
 
@@ -295,68 +560,23 @@ class IptvApi {
       safe('get_series'),
     ]);
 
-    if (r[3].isEmpty && r[4].isEmpty && r[5].isEmpty) {
+    final input = _XIn(
+      base: base,
+      user: _n(p.user),
+      pass: _n(p.pass),
+      ext: liveExt,
+      cachePath: cachePath ?? '',
+      raw: [for (final b in r) TransferableTypedData.fromList([b])],
+    );
+    final cat = await Isolate.run(() => _buildXtream(input));
+
+    if (cat.live.isEmpty && cat.movies.isEmpty && cat.series.isEmpty) {
       final e = err;
       if (e != null) throw e;
       throw const IptvException(
           'O servidor não retornou canais. Confira endereço, usuário e senha.');
     }
-
-    final liveCats = _cats(r[0]);
-    final vodCats = _cats(r[1]);
-    final serCats = _cats(r[2]);
-
-    final live = <Item>[];
-    for (final e in r[3]) {
-      if (e is! Map) continue;
-      final id = _s(e['stream_id']);
-      if (id.isEmpty) continue;
-      final icon = _s(e['stream_icon']);
-      live.add(Item(
-        id: id,
-        name: _s(e['name']),
-        url: '$base/live/${p.user}/${p.pass}/$id.$liveExt',
-        logo: icon.isEmpty ? null : icon,
-        category: _catName(liveCats, e['category_id']),
-        kind: Kind.live,
-      ));
-    }
-
-    final movies = <Item>[];
-    for (final e in r[4]) {
-      if (e is! Map) continue;
-      final id = _s(e['stream_id']);
-      if (id.isEmpty) continue;
-      final icon = _s(e['stream_icon']);
-      var ext = _s(e['container_extension']);
-      if (ext.isEmpty) ext = 'mp4';
-      movies.add(Item(
-        id: id,
-        name: _s(e['name']),
-        url: '$base/movie/${p.user}/${p.pass}/$id.$ext',
-        logo: icon.isEmpty ? null : icon,
-        category: _catName(vodCats, e['category_id']),
-        kind: Kind.movie,
-      ));
-    }
-
-    final series = <Item>[];
-    for (final e in r[5]) {
-      if (e is! Map) continue;
-      final id = _s(e['series_id']);
-      if (id.isEmpty) continue;
-      final cover = _s(e['cover']);
-      series.add(Item(
-        id: id,
-        name: _s(e['name']),
-        url: '',
-        logo: cover.isEmpty ? null : cover,
-        category: _catName(serCats, e['category_id']),
-        kind: Kind.series,
-      ));
-    }
-
-    return Catalog(live: live, movies: movies, series: series);
+    return cat;
   }
 
   /// Episódios de uma série Xtream.

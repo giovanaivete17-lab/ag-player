@@ -1,16 +1,36 @@
+
 import 'package:media_kit/media_kit.dart';
+
+import 'player_tuning.dart';
 
 class PlayerService {
   PlayerService() : player = Player();
 
   final Player player;
 
+  bool _configured = false;
+
+  Future<void> _configure() async {
+    if (_configured) return;
+
+    await PlayerTuning.apply(player, leve: true);
+
+    _configured = true;
+  }
+
   Future<void> play(String url) async {
-    await player.open(Media(url), play: true);
+    await _configure();
+
+    await player.open(
+      Media(url),
+      play: true,
+    );
   }
 
   Future<void> pause() => player.pause();
+
   Future<void> resume() => player.play();
+
   Future<void> stop() => player.stop();
 
   Future<void> setAspect(String mode) async {
@@ -19,9 +39,14 @@ class PlayerService {
       '16:9' => '16:9',
       _ => '-1',
     };
+
     final platform = player.platform;
+
     if (platform is NativePlayer) {
-      await platform.setProperty('video-aspect-override', value);
+      await platform.setProperty(
+        'video-aspect-override',
+        value,
+      );
     }
   }
 

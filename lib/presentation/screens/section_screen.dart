@@ -165,23 +165,30 @@ class _SectionScreenState extends State<SectionScreen>
 
   Future<void> _configurePlayer() async {
     final pl = _player.platform;
-    if (pl is NativePlayer) {
-      Future<void> set(String k, String v) async {
-        try {
-          await pl.setProperty(k, v);
-        } catch (_) {}
-      }
+    if (pl is! NativePlayer) return;
 
-      await set('user-agent', 'VLC/3.0.20 LibVLC/3.0.20');
-      await set('tls-verify', 'no');
-      await set('network-timeout', '20');
-      await set(
-        'stream-lavf-o',
-        'reconnect=1,reconnect_streamed=1,reconnect_delay_max=5',
-      );
-      await set('cache', 'yes');
-      await set('demuxer-readahead-secs', '20');
+    Future<void> set(String key, String value) async {
+      try {
+        await pl.setProperty(key, value);
+      } catch (_) {}
     }
+
+    await set('user-agent', 'VLC/3.0.20 LibVLC/3.0.20');
+    await set('tls-verify', 'no');
+    await set('network-timeout', '20');
+    await set(
+      'stream-lavf-o',
+      'reconnect=1,reconnect_streamed=1,reconnect_delay_max=5',
+    );
+
+    await set('cache', 'yes');
+    await set('hwdec', 'auto-safe');
+    await set('framedrop', 'decoder');
+    await set('video-sync', 'audio');
+    await set('interpolation', 'no');
+    await set('vd-lavc-threads', '0');
+    await set('correct-pts', 'yes');
+    await set('demuxer-readahead-secs', '15');
   }
 
   // ---------- favoritos ----------

@@ -1,3 +1,4 @@
+
 import 'package:flutter/material.dart';
 
 import '../../data/profiles/info_api.dart';
@@ -9,6 +10,7 @@ import 'section_screen.dart';
 class DashboardScreen extends StatefulWidget {
   final Profile profile;
   final Catalog catalog;
+
   const DashboardScreen({
     super.key,
     required this.profile,
@@ -29,8 +31,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
   @override
   void initState() {
     super.initState();
+
     final m = _recent(widget.catalog.movies);
     final s = _recent(widget.catalog.series);
+
     if (m.isNotEmpty) {
       _select(m.first, 1);
     } else if (s.isNotEmpty) {
@@ -44,8 +48,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
       _selTab = tab;
       _info = null;
     });
+
     InfoApi.load(widget.profile, it).then((i) {
-      if (mounted && _sel == it) setState(() => _info = i);
+      if (mounted && _sel == it) {
+        setState(() => _info = i);
+      }
     }).catchError((_) {});
   }
 
@@ -62,7 +69,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
   }
 
   Widget _poster(Item it, double w, double h) {
-    final l = it.logo;
+    final serverImage = _sel == it ? _info?.image : null;
+    final l = (serverImage != null && serverImage.trim().isNotEmpty)
+        ? serverImage
+        : it.logo;
+
     return ClipRRect(
       borderRadius: BorderRadius.circular(6),
       child: Container(
@@ -78,7 +89,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     textAlign: TextAlign.center,
                     maxLines: 4,
                     overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(color: Colors.white70, fontSize: 11),
+                    style: const TextStyle(
+                      color: Colors.white70,
+                      fontSize: 11,
+                    ),
                   ),
                 ),
               )
@@ -91,7 +105,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     textAlign: TextAlign.center,
                     maxLines: 4,
                     overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(color: Colors.white70, fontSize: 11),
+                    style: const TextStyle(
+                      color: Colors.white70,
+                      fontSize: 11,
+                    ),
                   ),
                 ),
               ),
@@ -101,13 +118,19 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
   Widget _shelf(String title, List<Item> items, int tab) {
     if (items.isEmpty) return const SizedBox.shrink();
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Padding(
           padding: const EdgeInsets.fromLTRB(16, 18, 16, 8),
-          child: Text(title,
-              style: const TextStyle(color: Colors.white70, fontSize: 14)),
+          child: Text(
+            title,
+            style: const TextStyle(
+              color: Colors.white70,
+              fontSize: 14,
+            ),
+          ),
         ),
         SizedBox(
           height: 160,
@@ -118,6 +141,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
             itemBuilder: (_, i) {
               final it = items[i];
               final selected = _sel == it;
+
               return GestureDetector(
                 onTap: () => _select(it, tab),
                 child: Padding(
@@ -157,23 +181,38 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
   Widget _highlight() {
     final it = _sel;
+
     if (it == null) return const SizedBox.shrink();
+
     final i = _info;
+
     String t(dynamic v) {
       final s = (v ?? '').toString().trim();
-      return s.isEmpty ? 'N/A' : s;
+      return s.isEmpty ? 'Não disponível' : s;
     }
 
-    Widget line(String k, String v) => Padding(
-          padding: const EdgeInsets.only(bottom: 4),
-          child: Text.rich(TextSpan(children: [
-            TextSpan(
+    Widget line(String k, String v) {
+      return Padding(
+        padding: const EdgeInsets.only(bottom: 5),
+        child: Text.rich(
+          TextSpan(
+            children: [
+              TextSpan(
                 text: '$k: ',
                 style: const TextStyle(
-                    color: Colors.white, fontWeight: FontWeight.bold)),
-            TextSpan(text: v, style: const TextStyle(color: Colors.white70)),
-          ])),
-        );
+                  color: Colors.white,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              TextSpan(
+                text: v,
+                style: const TextStyle(color: Colors.white70),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
 
     return Padding(
       padding: const EdgeInsets.all(16),
@@ -184,31 +223,61 @@ class _DashboardScreenState extends State<DashboardScreen> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(it.name,
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 20,
-                        fontWeight: FontWeight.bold)),
+                Text(
+                  it.name,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 20,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
                 const SizedBox(height: 8),
+
                 if (i != null) ...[
+                  if (i.year.isNotEmpty)
+                    line('Ano', i.year),
                   line('Direção', t(i.director)),
                   line('Duração', t(i.duration)),
                   line('Gênero', t(i.genre)),
                   line('Elenco', t(i.cast)),
-                  const SizedBox(height: 4),
-                  Text(t(i.plot),
-                      maxLines: 4,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                          color: Colors.white70, fontSize: 13)),
-                ] else
-                  Text(
-                    'Categoria: ${it.category}',
-                    style: const TextStyle(color: Colors.white70),
+
+                  const SizedBox(height: 10),
+
+                  const Text(
+                    'SINOPSE',
+                    style: TextStyle(
+                      color: agGold,
+                      fontWeight: FontWeight.bold,
+                      letterSpacing: 1,
+                    ),
                   ),
-                const SizedBox(height: 10),
+
+                  const SizedBox(height: 6),
+
+                  Text(
+                    t(i.plot),
+                    style: const TextStyle(
+                      color: Colors.white70,
+                      fontSize: 13,
+                      height: 1.5,
+                    ),
+                  ),
+
+                  if (i.rating.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 8),
+                      child: line('Avaliação', i.rating),
+                    ),
+                ] else
+                  const Text(
+                    'Carregando informações do conteúdo...',
+                    style: TextStyle(color: Colors.white70),
+                  ),
+
+                const SizedBox(height: 12),
+
                 ElevatedButton(
                   style: ElevatedButton.styleFrom(
                     backgroundColor: agGold,
@@ -220,6 +289,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
               ],
             ),
           ),
+
           const SizedBox(width: 12),
           _poster(it, 110, 160),
         ],
@@ -231,10 +301,16 @@ class _DashboardScreenState extends State<DashboardScreen> {
     return ListView(
       children: [
         _highlight(),
-        _shelf('Top Filmes Recém Adicionados',
-            _recent(widget.catalog.movies), 1),
-        _shelf('Top Séries Recém Adicionadas',
-            _recent(widget.catalog.series), 2),
+        _shelf(
+          'Top Filmes Recém Adicionados',
+          _recent(widget.catalog.movies),
+          1,
+        ),
+        _shelf(
+          'Top Séries Recém Adicionadas',
+          _recent(widget.catalog.series),
+          2,
+        ),
         const SizedBox(height: 24),
       ],
     );
@@ -248,38 +324,94 @@ class _DashboardScreenState extends State<DashboardScreen> {
       (Icons.movie, 'Filmes', () => _go(1)),
       (Icons.video_library, 'Séries', () => _go(2)),
       (Icons.favorite, 'Favoritos', () => _go(3)),
-      (Icons.person, 'Perfis', () => Navigator.of(context).pop()),
+      (
+        Icons.person,
+        'Perfis',
+        () => Navigator.of(context).pop(),
+      ),
     ];
 
     return Scaffold(
       backgroundColor: agBlack,
       body: SafeArea(
-        child: LayoutBuilder(builder: (context, c) {
-          final wide = c.maxWidth >= 700;
-          if (wide) {
-            return Row(
-              children: [
-                Container(
-                  width: 130,
-                  color: agPanel,
-                  child: Column(
-                    children: [
-                      const Padding(
-                        padding: EdgeInsets.symmetric(vertical: 20),
-                        child: Text('AG PLAYER',
+        child: LayoutBuilder(
+          builder: (context, c) {
+            final wide = c.maxWidth >= 700;
+
+            if (wide) {
+              return Row(
+                children: [
+                  Container(
+                    width: 130,
+                    color: agPanel,
+                    child: Column(
+                      children: [
+                        const Padding(
+                          padding: EdgeInsets.symmetric(vertical: 20),
+                          child: Text(
+                            'AG PLAYER',
                             style: TextStyle(
-                                color: agGold,
-                                fontWeight: FontWeight.bold,
-                                letterSpacing: 2)),
-                      ),
-                      for (final m in menu)
-                        ListTile(
-                          dense: true,
-                          leading: Icon(m.$1, color: agGold, size: 20),
-                          title: Text(m.$2,
+                              color: agGold,
+                              fontWeight: FontWeight.bold,
+                              letterSpacing: 2,
+                            ),
+                          ),
+                        ),
+                        for (final m in menu)
+                          ListTile(
+                            dense: true,
+                            leading: Icon(
+                              m.$1,
+                              color: agGold,
+                              size: 20,
+                            ),
+                            title: Text(
+                              m.$2,
                               style: const TextStyle(
-                                  color: Colors.white, fontSize: 13)),
-                          onTap: m.$3,
+                                color: Colors.white,
+                                fontSize: 13,
+                              ),
+                            ),
+                            onTap: m.$3,
+                          ),
+                      ],
+                    ),
+                  ),
+                  Expanded(child: _content()),
+                ],
+              );
+            }
+
+            return Column(
+              children: [
+                SizedBox(
+                  height: 52,
+                  child: ListView(
+                    scrollDirection: Axis.horizontal,
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    children: [
+                      for (final m in menu)
+                        Padding(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 4,
+                            vertical: 8,
+                          ),
+                          child: ActionChip(
+                            backgroundColor: agPanel,
+                            side: const BorderSide(color: agPanelLine),
+                            avatar: Icon(
+                              m.$1,
+                              color: agGold,
+                              size: 16,
+                            ),
+                            label: Text(
+                              m.$2,
+                              style: const TextStyle(
+                                color: Colors.white,
+                              ),
+                            ),
+                            onPressed: m.$3,
+                          ),
                         ),
                     ],
                   ),
@@ -287,35 +419,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 Expanded(child: _content()),
               ],
             );
-          }
-          return Column(
-            children: [
-              SizedBox(
-                height: 52,
-                child: ListView(
-                  scrollDirection: Axis.horizontal,
-                  padding: const EdgeInsets.symmetric(horizontal: 8),
-                  children: [
-                    for (final m in menu)
-                      Padding(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 4, vertical: 8),
-                        child: ActionChip(
-                          backgroundColor: agPanel,
-                          side: const BorderSide(color: agPanelLine),
-                          avatar: Icon(m.$1, color: agGold, size: 16),
-                          label: Text(m.$2,
-                              style: const TextStyle(color: Colors.white)),
-                          onPressed: m.$3,
-                        ),
-                      ),
-                  ],
-                ),
-              ),
-              Expanded(child: _content()),
-            ],
-          );
-        }),
+          },
+        ),
       ),
     );
   }

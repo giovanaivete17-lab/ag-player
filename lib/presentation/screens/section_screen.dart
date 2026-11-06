@@ -14,6 +14,10 @@ import '../../data/profiles/progress_store.dart';
 import '../../data/profiles/series_api.dart';
 import '../theme.dart';
 
+/// Mude para true se quiser as imagens (logos) na lista.
+/// Deixar false deixa o app bem mais leve em TV e projetor fracos.
+const bool _mostrarLogos = false;
+
 class _Media {
   final String name;
   final String url;
@@ -73,11 +77,16 @@ class _SectionScreenState extends State<SectionScreen>
   Timer? _hideTimer;
   Timer? _openTimer;
   Timer? _epgTimer;
+  Timer? _searchTimer;
 
   @override
   void initState() {
     super.initState();
     WakelockPlus.enable();
+    SystemChrome.setPreferredOrientations([
+      DeviceOrientation.landscapeLeft,
+      DeviceOrientation.landscapeRight,
+    ]);
     _tabs = TabController(
       length: 4,
       vsync: this,
@@ -92,7 +101,7 @@ class _SectionScreenState extends State<SectionScreen>
     _loadFavs();
 
     _player = Player(
-      configuration: const PlayerConfiguration(bufferSize: 24 * 1024 * 1024),
+      configuration: const PlayerConfiguration(bufferSize: 16 * 1024 * 1024),
     );
     _video = VideoController(_player);
     _cfg = _configurePlayer();
@@ -147,6 +156,7 @@ class _SectionScreenState extends State<SectionScreen>
     _hideTimer?.cancel();
     _openTimer?.cancel();
     _epgTimer?.cancel();
+    _searchTimer?.cancel();
     FavoritesStore.changes.removeListener(_loadFavs);
     for (final s in _subs) {
       s.cancel();
@@ -154,8 +164,11 @@ class _SectionScreenState extends State<SectionScreen>
     _saveNow();
     _player.dispose();
     WakelockPlus.disable();
-    SystemChrome.setPreferredOrientations(DeviceOrientation.values);
-    SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    SystemChrome.setPreferredOrientations([
+      DeviceOrientation.landscapeLeft,
+      DeviceOrientation.landscapeRight,
+    ]);
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
     _tabs.dispose();
     _search.dispose();
     _posN.dispose();
@@ -180,8 +193,30 @@ class _SectionScreenState extends State<SectionScreen>
         'reconnect=1,reconnect_streamed=1,reconnect_delay_max=5',
       );
       await set('cache', 'yes');
-      await set('demuxer-readahead-secs', '20');
+      await set('demuxer-max-back-bytes', '4MiB');
+      await set('vd-lavc-fast', 'yes');
+      await set('vd-lavc-skiploopfilter', 'nonref');
+      await set('framedrop', 'vo');
     }
+  }
+
+  bool _is4k(_Media m) {
+    final n = m.name.toLowerCase();
+    return n.contains('4k') || n.contains('uhd') || n.contains('2160');
+  }
+
+  /// Buffer pequeno nos canais comuns (leve) e maior nos 4K.
+  Future<void> _tuneFor(_Media m) async {
+    final pl = _player.platform;
+    if (pl is! NativePlayer) return;
+    final big = _is4k(m);
+    try {
+      await pl.setProperty('demuxer-max-bytes', big ? '64MiB' : '16MiB');
+      await pl.setProperty(
+        'demuxer-readahead-secs',
+        big ? '30' : (m.live ? '10' : '20'),
+      );
+    } catch (_) {}
   }
 
   // ---------- favoritos ----------
@@ -444,6 +479,7 @@ class _SectionScreenState extends State<SectionScreen>
     _ci = 0;
     _loadEpg(m);
     await _cfg;
+    await _tuneFor(m);
     await _openUrl(_cands[0]);
     if (!m.live) {
       final saved = await _loadSaved(m.url);
@@ -497,8 +533,11 @@ class _SectionScreenState extends State<SectionScreen>
   Future<void> _exitFull() async {
     _hideTimer?.cancel();
     if (mounted) setState(() => _full = false);
-    await SystemChrome.setPreferredOrientations(DeviceOrientation.values);
-    await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    await SystemChrome.setPreferredOrientations([
+      DeviceOrientation.landscapeLeft,
+      DeviceOrientation.landscapeRight,
+    ]);
+    await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
   }
 
   KeyEventResult _onKey(FocusNode node, KeyEvent e) {
@@ -747,13 +786,24 @@ class _SectionScreenState extends State<SectionScreen>
     );
   }
 
+  Widget _kindIcon(Item it) {
+    final IconData ic = it.kind == Kind.live
+        ? Icons.live_tv
+        : (it.kind == Kind.movie ? Icons.movie : Icons.video_library);
+    return SizedBox(
+      width: 44,
+      height: 44,
+      child: Icon(ic, color: agGold, size: 24),
+    );
+  }
+
   Widget _row(Item it) {
     final playing = _current?.url == it.url;
     final pid = widget.profile.id;
     return ListTile(
       dense: true,
       focusColor: agGold.withOpacity(0.25),
-      leading: _logo(it),
+      leading: _mostrarLogos ? _logo(it) : _kindIcon(it),
       title: Text(
         it.name,
         maxLines: 2,
@@ -1056,7 +1106,12 @@ class _SectionScreenState extends State<SectionScreen>
       child: TextField(
         controller: _search,
         style: const TextStyle(color: Colors.white),
-        onChanged: (v) => setState(() => _query = v.trim().toLowerCase()),
+        onChanged: (v) {
+          _searchTimer?.cancel();
+          _searchTimer = Timer(const Duration(milliseconds: 350), () {
+            if (mounted) setState(() => _query = v.trim().toLowerCase());
+          });
+        },
         decoration: InputDecoration(
           isDense: true,
           filled: true,

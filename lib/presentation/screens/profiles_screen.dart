@@ -1,6 +1,12 @@
+
+import 'dart:io';
+
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:path_provider/path_provider.dart';
 
 import '../../data/profiles/profile.dart';
+import '../../data/profiles/iptv_api.dart';
 import '../theme.dart';
 
 class ProfilesScreen extends StatefulWidget {
@@ -22,23 +28,22 @@ class _ProfilesScreenState extends State<ProfilesScreen> {
   }
 
   Future<void> _load() async {
-    try {
-      final l = await ProfileStore.load();
-      final a = await ProfileStore.activeId();
-      if (!mounted) return;
-      setState(() {
-        _list = l;
-        _activeId = a;
-        _loading = false;
-      });
-    } catch (_) {
-      if (mounted) setState(() => _loading = false);
-    }
+    final l = await ProfileStore.load();
+    final a = await ProfileStore.activeId();
+
+    if (!mounted) return;
+
+    setState(() {
+      _list = l;
+      _activeId = a;
+      _loading = false;
+    });
   }
 
-  void _snack(String msg) {
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  void _snack(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message)),
+    );
   }
 
   Future<void> _add() async {
@@ -46,15 +51,19 @@ class _ProfilesScreenState extends State<ProfilesScreen> {
       context: context,
       builder: (_) => const _AddDialog(),
     );
+
     if (p == null) return;
-    final next = [..._list, p];
+
     try {
+      final next = [..._list, p];
       await ProfileStore.save(next);
+
       if (!mounted) return;
+
       setState(() => _list = next);
-      _snack('Lista salva. Toque nela para entrar.');
+      _snack('Conexão salva com sucesso!');
     } catch (e) {
-      _snack('Não consegui salvar: $e');
+      _snack('Erro ao salvar conexão: $e');
     }
   }
 
@@ -62,43 +71,43 @@ class _ProfilesScreenState extends State<ProfilesScreen> {
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        backgroundColor: agPanel,
-        title: const Text('Remover lista?',
-            style: TextStyle(color: Colors.white)),
-        content: Text(p.name, style: const TextStyle(color: Colors.white70)),
+        title: const Text('Remover conexão?'),
+        content: Text(p.name),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('Cancelar', style: TextStyle(color: agGold)),
+            child: const Text('Cancelar'),
           ),
           TextButton(
             onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('Remover', style: TextStyle(color: Colors.redAccent)),
+            child: const Text('Remover'),
           ),
         ],
       ),
     );
+
     if (ok != true) return;
+
     final next = _list.where((e) => e.id != p.id).toList();
-    try {
-      await ProfileStore.save(next);
-      if (!mounted) return;
-      setState(() => _list = next);
-    } catch (e) {
-      _snack('Não consegui remover: $e');
-    }
+    await ProfileStore.save(next);
+
+    if (!mounted) return;
+
+    setState(() => _list = next);
   }
 
   Future<void> _select(Profile p) async {
     await ProfileStore.setActive(p.id);
+
     if (!mounted) return;
+
     Navigator.of(context).pop(p);
   }
 
-  String _host(String u) {
-    final uri = Uri.tryParse(u);
-    if (uri != null && uri.host.isNotEmpty) return uri.host;
-    return u;
+  String _description(Profile p) {
+    if (p.type == 'xtream') return 'Xtream Codes';
+    if (p.type == 'm3u_file') return 'Arquivo M3U';
+    return 'Lista M3U por URL';
   }
 
   @override
@@ -108,26 +117,25 @@ class _ProfilesScreenState extends State<ProfilesScreen> {
       appBar: AppBar(
         backgroundColor: agBlack,
         foregroundColor: agGold,
-        title: const Text('Minhas listas'),
+        title: const Text('Minhas conexões'),
       ),
       floatingActionButton: FloatingActionButton.extended(
         backgroundColor: agGold,
         foregroundColor: Colors.black,
         onPressed: _add,
         icon: const Icon(Icons.add),
-        label: const Text('Adicionar lista'),
+        label: const Text('Adicionar conexão'),
       ),
       body: _loading
-          ? const Center(child: CircularProgressIndicator(color: agGold))
+          ? const Center(
+              child: CircularProgressIndicator(color: agGold),
+            )
           : _list.isEmpty
               ? const Center(
-                  child: Padding(
-                    padding: EdgeInsets.all(24),
-                    child: Text(
-                      'Nenhuma lista salva ainda.\nToque em "Adicionar lista".',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(color: Colors.white54),
-                    ),
+                  child: Text(
+                    'Bem-vindo ao AG PLAYER!\n\nAdicione sua primeira conexão.',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(color: Colors.white70),
                   ),
                 )
               : ListView.builder(
@@ -135,31 +143,31 @@ class _ProfilesScreenState extends State<ProfilesScreen> {
                   itemCount: _list.length,
                   itemBuilder: (_, i) {
                     final p = _list[i];
-                    final active = p.id == _activeId;
+
                     return Card(
                       color: agPanel,
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(10),
-                        side: BorderSide(
-                          color: active ? agGold : agPanelLine,
-                        ),
-                      ),
                       child: ListTile(
                         leading: Icon(
-                          p.type == 'xtream' ? Icons.dns : Icons.list_alt,
+                          p.type == 'xtream'
+                              ? Icons.dns
+                              : p.type == 'm3u_file'
+                                  ? Icons.folder
+                                  : Icons.link,
                           color: agGold,
                         ),
-                        title: Text(p.name,
-                            style: const TextStyle(color: Colors.white)),
+                        title: Text(
+                          p.name,
+                          style: const TextStyle(color: Colors.white),
+                        ),
                         subtitle: Text(
-                          '${p.type == 'xtream' ? 'Xtream' : 'M3U'} · ${_host(p.url)}',
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
+                          _description(p),
                           style: const TextStyle(color: Colors.white54),
                         ),
                         trailing: IconButton(
-                          icon: const Icon(Icons.delete_outline,
-                              color: Colors.white54),
+                          icon: const Icon(
+                            Icons.delete_outline,
+                            color: Colors.white54,
+                          ),
                           onPressed: () => _remove(p),
                         ),
                         onTap: () => _select(p),
@@ -183,8 +191,11 @@ class _AddDialogState extends State<_AddDialog> {
   final _url = TextEditingController();
   final _user = TextEditingController();
   final _pass = TextEditingController();
-  bool _xtream = true;
-  String? _err;
+
+  int _mode = 0;
+  String? _filePath;
+  String? _fileName;
+  String? _error;
 
   @override
   void dispose() {
@@ -195,125 +206,174 @@ class _AddDialogState extends State<_AddDialog> {
     super.dispose();
   }
 
-  InputDecoration _dec(String label) => InputDecoration(
-        labelText: label,
-        labelStyle: const TextStyle(color: Colors.white54),
-        enabledBorder: const UnderlineInputBorder(
-          borderSide: BorderSide(color: agPanelLine),
-        ),
-        focusedBorder: const UnderlineInputBorder(
-          borderSide: BorderSide(color: agGold),
-        ),
-      );
+  Future<void> _pickFile() async {
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['m3u', 'm3u8'],
+      withData: true,
+    );
 
-  void _ok() {
-    var url = _url.text.trim();
-    final name = _name.text.trim();
-    if (url.isEmpty) {
-      setState(() => _err = _xtream ? 'Preencha o servidor.' : 'Cole o link da lista.');
+    if (result == null) return;
+
+    final bytes = result.files.single.bytes;
+
+    if (bytes == null || bytes.isEmpty) {
+      setState(() => _error = 'Não foi possível ler o arquivo.');
       return;
     }
-    if (_xtream) {
-      if (_user.text.trim().isEmpty || _pass.text.trim().isEmpty) {
-        setState(() => _err = 'Preencha usuário e senha.');
-        return;
-      }
-      if (!url.startsWith('http')) url = 'http://$url';
-      while (url.endsWith('/')) {
-        url = url.substring(0, url.length - 1);
-      }
-    }
-    final p = Profile(
-      id: DateTime.now().microsecondsSinceEpoch.toString(),
-      name: name.isEmpty ? 'Minha lista' : name,
-      type: _xtream ? 'xtream' : 'm3u',
-      url: url,
-      user: _xtream ? _user.text.trim() : '',
-      pass: _xtream ? _pass.text.trim() : '',
+
+    final dir = await getApplicationDocumentsDirectory();
+    final folder = Directory('${dir.path}/AGPlayer/listas');
+
+    await folder.create(recursive: true);
+
+    final file = File(
+      '${folder.path}/${DateTime.now().microsecondsSinceEpoch}_${result.files.single.name}',
     );
-    Navigator.of(context).pop(p);
+
+    await file.writeAsBytes(bytes, flush: true);
+
+    if (!mounted) return;
+
+    setState(() {
+      _filePath = file.path;
+      _fileName = result.files.single.name;
+      _error = null;
+    });
+  }
+
+  void _ok() {
+    if (_mode == 0 &&
+        (_user.text.trim().isEmpty || _pass.text.trim().isEmpty)) {
+      setState(() => _error = 'Informe usuário e senha.');
+      return;
+    }
+
+    if (_mode == 1 && _url.text.trim().isEmpty) {
+      setState(() => _error = 'Informe a URL M3U.');
+      return;
+    }
+
+    if (_mode == 2 && _filePath == null) {
+      setState(() => _error = 'Selecione um arquivo M3U.');
+      return;
+    }
+
+    final type = ['xtream', 'm3u', 'm3u_file'][_mode];
+
+    Navigator.pop(
+      context,
+      Profile(
+        id: DateTime.now().microsecondsSinceEpoch.toString(),
+        name: _name.text.trim().isEmpty
+            ? 'Minha conexão'
+            : _name.text.trim(),
+        type: type,
+        url: _mode == 0
+            ? IptvApi.defaultServer
+            : _mode == 1
+                ? _url.text.trim()
+                : _filePath!,
+        user: _mode == 0 ? _user.text.trim() : '',
+        pass: _mode == 0 ? _pass.text.trim() : '',
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     return AlertDialog(
       backgroundColor: agPanel,
-      title: const Text('Adicionar lista',
-          style: TextStyle(color: agGold)),
+      title: const Text(
+        'Nova conexão',
+        style: TextStyle(color: agGold),
+      ),
       content: SingleChildScrollView(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
             Row(
               children: [
-                ChoiceChip(
-                  label: const Text('Usuário e senha'),
-                  selected: _xtream,
-                  selectedColor: agGold,
-                  backgroundColor: agBlack,
-                  labelStyle: TextStyle(
-                      color: _xtream ? Colors.black : Colors.white,
-                      fontSize: 12),
-                  onSelected: (_) => setState(() => _xtream = true),
-                ),
-                const SizedBox(width: 8),
-                ChoiceChip(
-                  label: const Text('Link M3U'),
-                  selected: !_xtream,
-                  selectedColor: agGold,
-                  backgroundColor: agBlack,
-                  labelStyle: TextStyle(
-                      color: !_xtream ? Colors.black : Colors.white,
-                      fontSize: 12),
-                  onSelected: (_) => setState(() => _xtream = false),
-                ),
+                _option('Xtream', 0),
+                _option('URL M3U', 1),
+                _option('Arquivo', 2),
               ],
             ),
             TextField(
               controller: _name,
               style: const TextStyle(color: Colors.white),
-              decoration: _dec('Nome (opcional)'),
+              decoration: const InputDecoration(
+                labelText: 'Nome da conexão',
+              ),
             ),
-            TextField(
-              controller: _url,
-              style: const TextStyle(color: Colors.white),
-              keyboardType: TextInputType.url,
-              autocorrect: false,
-              decoration:
-                  _dec(_xtream ? 'Servidor (ex: http://site.com:8080)' : 'Link da lista M3U'),
-            ),
-            if (_xtream) ...[
+            if (_mode == 0) ...[
               TextField(
                 controller: _user,
                 style: const TextStyle(color: Colors.white),
-                autocorrect: false,
-                decoration: _dec('Usuário'),
+                decoration: const InputDecoration(labelText: 'Usuário'),
               ),
               TextField(
                 controller: _pass,
-                style: const TextStyle(color: Colors.white),
-                autocorrect: false,
                 obscureText: true,
-                decoration: _dec('Senha'),
+                style: const TextStyle(color: Colors.white),
+                decoration: const InputDecoration(labelText: 'Senha'),
               ),
             ],
-            if (_err != null) ...[
-              const SizedBox(height: 10),
-              Text(_err!, style: const TextStyle(color: Colors.redAccent)),
-            ],
+            if (_mode == 1)
+              TextField(
+                controller: _url,
+                style: const TextStyle(color: Colors.white),
+                decoration: const InputDecoration(labelText: 'URL M3U'),
+              ),
+            if (_mode == 2)
+              Column(
+                children: [
+                  ElevatedButton(
+                    onPressed: _pickFile,
+                    child: const Text('Escolher arquivo M3U'),
+                  ),
+                  if (_fileName != null)
+                    Text(
+                      _fileName!,
+                      style: const TextStyle(color: Colors.white),
+                    ),
+                ],
+              ),
+            if (_error != null)
+              Text(
+                _error!,
+                style: const TextStyle(color: Colors.red),
+              ),
           ],
         ),
       ),
       actions: [
         TextButton(
-          onPressed: () => Navigator.of(context).pop(),
-          child: const Text('Cancelar', style: TextStyle(color: Colors.white70)),
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Cancelar'),
         ),
-        TextButton(
+        ElevatedButton(
           onPressed: _ok,
-          child: const Text('Salvar', style: TextStyle(color: agGold)),
+          child: const Text('Salvar'),
         ),
       ],
+    );
+  }
+
+  Widget _option(String title, int value) {
+    return Expanded(
+      child: TextButton(
+        onPressed: () => setState(() {
+          _mode = value;
+          _error = null;
+        }),
+        child: Text(
+          title,
+          style: TextStyle(
+            color: _mode == value ? agGold : Colors.white70,
+          ),
+        ),
+      ),
     );
   }
 }

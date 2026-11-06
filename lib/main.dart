@@ -8,6 +8,9 @@ import 'data/settings_store.dart';
 import 'presentation/screens/home_screen.dart';
 import 'presentation/theme.dart';
 
+const agWhite = Colors.white;
+const agRed = Color(0xFFE53935);
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   FlutterError.onError = (d) {
@@ -36,7 +39,27 @@ class AgPlayerApp extends StatelessWidget {
     return MaterialApp(
       title: 'AG Player',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData.dark().copyWith(scaffoldBackgroundColor: agBlack),
+      theme: ThemeData(
+        useMaterial3: true,
+        brightness: Brightness.light,
+        scaffoldBackgroundColor: agWhite,
+        colorScheme: const ColorScheme.light(
+          primary: agRed,
+          secondary: agRed,
+          surface: agWhite,
+          onSurface: Color(0xFF000000),
+        ),
+        appBarTheme: const AppBarTheme(
+          backgroundColor: agWhite,
+          foregroundColor: Color(0xFF000000),
+          elevation: 0,
+        ),
+        iconTheme: const IconThemeData(color: Color(0xFF000000)),
+        sliderTheme: const SliderThemeData(
+          activeTrackColor: agRed,
+          thumbColor: agRed,
+        ),
+      ),
       home: const HomeScreen(),
     );
   }

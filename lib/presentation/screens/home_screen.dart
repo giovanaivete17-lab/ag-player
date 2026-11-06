@@ -3,9 +3,12 @@ import 'package:flutter/material.dart';
 import '../../data/profiles/favorites_store.dart';
 import '../../data/profiles/iptv_api.dart';
 import '../../data/profiles/profile.dart';
-import '../theme.dart';
 import 'dashboard_screen.dart';
 import 'profiles_screen.dart';
+
+const _white = Colors.white;
+const _black = Color(0xFF000000);
+const _red = Color(0xFFE53935);
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -90,71 +93,84 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: agBlack,
-      body: SafeArea(
-        child: Center(
-          child: Padding(
-            padding: const EdgeInsets.all(24),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const Text(
-                  'AG PLAYER',
-                  style: TextStyle(
-                    color: agGold,
-                    fontSize: 34,
-                    fontWeight: FontWeight.bold,
-                    letterSpacing: 4,
-                  ),
-                ),
-                const SizedBox(height: 32),
-                if (_loading) ...[
-                  const CircularProgressIndicator(color: agGold),
-                  const SizedBox(height: 16),
-                  const Text(
-                    'Carregando sua lista...',
-                    style: TextStyle(color: Colors.white70),
-                  ),
-                ] else ...[
-                  if (_error != null) ...[
-                    Text(
-                      _error!,
-                      textAlign: TextAlign.center,
-                      style: const TextStyle(color: Colors.redAccent),
+      backgroundColor: _white,
+      body: Stack(
+        children: [
+          SafeArea(
+            child: Center(
+              child: Padding(
+                padding: const EdgeInsets.all(24),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Text(
+                      'AG PLAYER',
+                      style: TextStyle(
+                        color: _black,
+                        fontSize: 34,
+                        fontWeight: FontWeight.bold,
+                        letterSpacing: 4,
+                      ),
                     ),
-                    const SizedBox(height: 20),
-                  ],
-                  if (_profile != null)
-                    SizedBox(
-                      width: double.infinity,
-                      child: ElevatedButton(
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: agGold,
-                          foregroundColor: Colors.black,
-                          padding: const EdgeInsets.symmetric(vertical: 14),
+                    const SizedBox(height: 8),
+                    Container(width: 80, height: 4, color: _red),
+                    const SizedBox(height: 32),
+                    if (_loading) ...[
+                      const CircularProgressIndicator(color: _red),
+                      const SizedBox(height: 16),
+                      const Text(
+                        'Carregando sua lista...',
+                        style: TextStyle(color: Colors.black54),
+                      ),
+                    ] else ...[
+                      if (_error != null) ...[
+                        Text(
+                          _error!,
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(color: _red),
                         ),
-                        onPressed: () => _open(_profile!),
-                        child: Text('Entrar em ${_profile!.name}'),
+                        const SizedBox(height: 20),
+                      ],
+                      if (_profile != null)
+                        SizedBox(
+                          width: double.infinity,
+                          child: ElevatedButton(
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: _red,
+                              foregroundColor: _white,
+                              padding:
+                                  const EdgeInsets.symmetric(vertical: 14),
+                            ),
+                            onPressed: () => _open(_profile!),
+                            child: Text('Entrar em ${_profile!.name}'),
+                          ),
+                        ),
+                      const SizedBox(height: 12),
+                      SizedBox(
+                        width: double.infinity,
+                        child: OutlinedButton(
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: _black,
+                            side: const BorderSide(color: _red, width: 2),
+                            padding: const EdgeInsets.symmetric(vertical: 14),
+                          ),
+                          onPressed: _choose,
+                          child: const Text('Perfis / adicionar lista'),
+                        ),
                       ),
-                    ),
-                  const SizedBox(height: 12),
-                  SizedBox(
-                    width: double.infinity,
-                    child: OutlinedButton(
-                      style: OutlinedButton.styleFrom(
-                        foregroundColor: agGold,
-                        side: const BorderSide(color: agGold),
-                        padding: const EdgeInsets.symmetric(vertical: 14),
-                      ),
-                      onPressed: _choose,
-                      child: const Text('Perfis / adicionar lista'),
-                    ),
-                  ),
-                ],
-              ],
+                    ],
+                  ],
+                ),
+              ),
             ),
           ),
-        ),
+          Positioned(
+            top: 0,
+            left: 0,
+            right: 0,
+            child: Container(height: 6, color: _red),
+          ),
+        ],
       ),
     );
   }
